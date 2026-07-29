@@ -45,7 +45,7 @@ def select_ridge_parameter(Features, Y, ridge_lower, ridge_upper):
     U, S, Vh = torch.linalg.svd(X, full_matrices=False)
     S_sq = S**2
     UTY = U.T @ Y
-    ridges = torch.tensor(10.0 ** np.arange(ridge_lower, ridge_upper))
+    ridges = torch.tensor(10.0 ** np.arange(ridge_lower, ridge_upper), device=X.device)
     n_samples = X.shape[0]
     
     gcv_scores = []
@@ -119,15 +119,12 @@ class UnifiedCosineClassifier:
         """
         self.num_total_classes = num_total_classes
         self.device = device
-        self.num_seen_classes = 0          # Số class đã học đến hiện tại
-        self.class_centroids: list[torch.Tensor] = []  # prototype mỗi class
+        # fitted_class_indices: danh sách global class idx đã được fit (thứ tự thêm vào)
+        self.fitted_class_indices: list[int] = []
 
-        # current_dim: số hàng hiện tại của W = tổng số neuron đã khởi tạo.
-        # Bắt đầu bằng k (init_dim), tăng m mỗi task qua grow_projection().
         self._current_dim: int = init_dim
 
-        # W shape: (current_dim, num_total_classes) — sẽ được grow theo chiều hàng.
-        # Chỉ cột [:num_seen_classes] có nghĩa tại bất kỳ thời điểm nào.
+        # W[:, global_class_idx] chứa trọng số của class đó sau khi fit()
         self.W = torch.zeros(init_dim, num_total_classes, device=device)  # (k, C_total)
 
     # ------------------------------------------------------------------
@@ -160,124 +157,77 @@ class UnifiedCosineClassifier:
         self.W = torch.cat([self.W, padding], dim=0)  # (D_new, C_total)
         self._current_dim += num_new_neurons
         # Kết quả:
-        # - Cột class cũ [:num_seen_classes]: hàng [D_old:D_new] = 0  ← zero-padded
-        # - Cột class mới (chưa điền): toàn 0, sẽ được fit() ghi vào sau
+        # - Cột class cũ (đã được fit): hàng [D_old:D_new] = 0  ← zero-padded
+        # - Cột class mới (chưa fit):   toàn 0, sẽ được fit() ghi vào sau
 
     # ------------------------------------------------------------------
-    # expand_classes: ghi nhận class mới (chỉ cập nhật con trỏ)
+    # expand: no-op, kept for API compatibility
     # ------------------------------------------------------------------
     def expand(self, num_new_classes: int) -> None:
-        """
-        Đăng ký thêm `num_new_classes` class mới vào classifier.
-        Các cột tương ứng trong W sẽ được điền bởi fit().
-        """
-        assert self.num_seen_classes + num_new_classes <= self.num_total_classes, (
-            f"Vượt quá num_total_classes={self.num_total_classes}. "
-            f"Đang cố thêm {num_new_classes} class, hiện có {self.num_seen_classes}."
-        )
-        self.num_seen_classes += num_new_classes
+        """No-op: class tracking done automatically inside fit()."""
+        pass
 
     # ------------------------------------------------------------------
-    # Fit: ghi nghiệm Ridge vào đúng cột của W, lưu centroid
+    # Fit: ghi nghiệm Ridge vào đúng cột W theo global class index
     # ------------------------------------------------------------------
     def fit(
         self,
-        Wo_task: torch.Tensor,       # (expand_dim, num_classes_this_task) — nghiệm Ridge
-        task_class_indices: list[int],  # global index của từng class trong task này
-        train_embeddings: torch.Tensor, # (expand_dim, N) — projected features (sparse OK)
-        train_labels: torch.Tensor,     # (N,) — global class labels
+        Wo_task: torch.Tensor,          # (D, K) — nghiệm Ridge
+        task_class_indices: list[int],  # global class indices (KHÔNG cần sequential)
+        train_embeddings=None,          # unused, kept for compat
+        train_labels=None,              # unused, kept for compat
     ) -> None:
         """
-        Ghi cột nghiệm Ridge Wo_task vào ma trận W toàn cục,
-        đồng thời tính và lưu class centroid (prototype) cho mỗi class mới.
-
-        Args:
-            Wo_task           : (D, K) — nghiệm Ridge cho K class của task hiện tại.
-            task_class_indices: list global class id, len = K.
-            train_embeddings  : (D, N) — projected & WTA features, dùng để tính centroid.
-            train_labels      : (N,)   — global label tương ứng với mỗi sample.
+        Ghi W[:, global_idx] = Wo_task[:, local_idx] cho từng class.
+        Không giả định classes là sequential — dùng đúng global index.
         """
-        # Ghi cột nghiệm vào W
         for local_idx, global_idx in enumerate(task_class_indices):
             self.W[:, global_idx] = Wo_task[:, local_idx]
-
-        # Tính và lưu centroid (mean feature) cho mỗi class
-        # Dense embedding để tính mean dễ hơn
-        if train_embeddings.is_sparse:
-            dense_emb = train_embeddings.to_dense()   # (D, N)
-        else:
-            dense_emb = train_embeddings              # (D, N)
-
-        for global_idx in task_class_indices:
-            mask = (train_labels == global_idx)        # (N,)
-            if mask.sum() == 0:
-                centroid = torch.zeros(self._current_dim, device=self.device)
-            else:
-                centroid = dense_emb[:, mask].mean(dim=1)  # (D,)
-                centroid = F.normalize(centroid, p=2, dim=0)
-            # Đảm bảo danh sách centroids đủ dài
-            while len(self.class_centroids) <= global_idx:
-                self.class_centroids.append(None)
-            self.class_centroids[global_idx] = centroid
+        for g in task_class_indices:
+            if g not in self.fitted_class_indices:
+                self.fitted_class_indices.append(g)
 
     # ------------------------------------------------------------------
-    # Predict: Cosine Classifier — không cần task_id
+    # Predict: Cosine Classifier — không cần task_id, trả về GLOBAL class idx
     # ------------------------------------------------------------------
     def predict(self, z: torch.Tensor) -> torch.Tensor:
         """
         Dự đoán global class label bằng Cosine Similarity.
-
-        Thay vì raw logit = z @ W (bị lệch scale giữa các task),
-        ta L2-normalize cả z lẫn từng cột W trước khi tính similarity.
-
-        Args:
-            z : (N, D) hoặc (D, N) — projected features (dense tensor).
-                Nếu là (D, N) sẽ được transpose tự động.
-
-        Returns:
-            predicts : (N,) — global class index dự đoán.
+        Chỉ so sánh với các class đã được fit (fitted_class_indices).
+        Trả về global class index (CPU tensor).
         """
-        if z.dim() == 2 and z.shape[0] == self._current_dim and z.shape[1] != self._current_dim:
+        # Xử lý shape: (D, N) → (N, D)
+        # Dùng .shape[1] vì không thể biết chiều nào là D khi D==N
+        if z.dim() == 2 and z.shape[0] == self._current_dim:
             z = z.T  # (D, N) -> (N, D)
 
-        # L2-normalize feature vectors: z_norm shape (N, D)
-        z_norm = F.normalize(z.float(), p=2, dim=1)
+        z_norm = F.normalize(z.float(), p=2, dim=1)  # (N, D)
 
-        # Lấy phần W có nghĩa: (current_dim, C_seen)
-        W_active = self.W[:, :self.num_seen_classes]         # (D, C_seen)
-        # L2-normalize từng cột prototype: (D, C_seen)
-        W_norm = F.normalize(W_active.float(), p=2, dim=0)
+        # Lấy đúng cột của các class đã fit (KHÔNG dùng :num_seen_classes)
+        fitted  = sorted(self.fitted_class_indices)
+        W_active = self.W[:, fitted]                           # (D, num_fitted)
+        W_norm   = F.normalize(W_active.float(), p=2, dim=0)  # (D, num_fitted)
 
-        # Cosine similarity: (N, C_seen)
-        cosine_logits = z_norm @ W_norm
+        cosine_logits = z_norm @ W_norm                        # (N, num_fitted)
+        local_preds   = cosine_logits.argmax(dim=1)            # (N,) — index vào fitted
 
-        # argmax → global class index
-        predicts = cosine_logits.argmax(dim=1)               # (N,)
-        return predicts
+        # Ánh xạ local index → global class index
+        fitted_t = torch.tensor(fitted, dtype=torch.long, device=self.device)
+        global_preds = fitted_t[local_preds].cpu()  # (N,) global idx, trên CPU
+        return global_preds
 
     # ------------------------------------------------------------------
-    # Evaluate: wrapper tiện lợi trả về accuracy
+    # Evaluate: wrapper trả về accuracy (%)
     # ------------------------------------------------------------------
     def evaluate(
         self,
-        test_embeddings: torch.Tensor,   # (D, N) projected features
-        test_labels: torch.Tensor,       # (N,) global labels
+        test_embeddings: torch.Tensor,  # (D, N)
+        test_labels: torch.Tensor,      # (N,) global labels
     ) -> float:
-        """
-        Tính test accuracy (%) trên tập test mà không cần task_id.
-
-        Args:
-            test_embeddings : (D, N) — projected & WTA features (có thể sparse).
-            test_labels     : (N,)   — global class labels.
-
-        Returns:
-            accuracy : float — accuracy (%) trên tập test.
-        """
         if test_embeddings.is_sparse:
-            test_embeddings = test_embeddings.to_dense()  # (D, N)
-        predicts = self.predict(test_embeddings)          # (N,)
-        accuracy = (predicts.cpu() == test_labels.cpu()).float().mean().item() * 100.0
-        return accuracy
+            test_embeddings = test_embeddings.to_dense()
+        predicts = self.predict(test_embeddings)  # (N,) global idx, CPU
+        return (predicts == test_labels.cpu()).float().mean().item() * 100.0
 
 
 if __name__ == "__main__":
@@ -314,14 +264,7 @@ if __name__ == "__main__":
     training_time = []
     feature_extract_time = []
 
-    # TODO: RAPID - [Ridge Regression State Init]
-    # Q và G là các ma trận tích lũy (sufficient statistics) cho Ridge Regression.
-    # Q = X^T @ Y (cross-covariance), G = X^T @ X (gram matrix).
-    # Trong RAPID, khi expand feature space, kích thước của Q và G cần được
-    # cập nhật động (grow) để phù hợp với expand_dim mới sau mỗi task.
-    Q = torch.zeros(args.expand_dim, args.num_classes).to(device)
-    G = torch.zeros(args.expand_dim, args.expand_dim).to(device)
-    last_ridge = None
+    # Ridge Regression dùng per-task (không cần global Q/G vì classes không sequential)
 
     # TODO: RAPID - [Unified Classifier Init]
     # Khởi tạo Single Unified Cosine Classifier thay thế toàn bộ per-task head.
@@ -378,56 +321,33 @@ if __name__ == "__main__":
         train_embeddings = output  # (current_proj_dim, N)
 
         # ----------------------------------------------------------------
-        # Xác định global class indices của task hiện tại
-        # (giả định CIL split đồng đều: task t sở hữu class [t*K, (t+1)*K) )
+        # Lấy ACTUAL global class indices từ data (load_dataset dùng random.sample
+        # nên thứ tự class hoàn toàn ngẫu nhiên — KHÔNG giả định sequential)
         # ----------------------------------------------------------------
-        task_class_start = task * num_classes_per_task
-        task_class_end   = task_class_start + num_classes_per_task
-        task_class_indices = list(range(task_class_start, task_class_end))
+        actual_classes   = sorted([int(c) for c in train_labels.unique().cpu().tolist()])
+        num_task_classes = len(actual_classes)
 
-        # ----------------------------------------------------------------
-        # One-hot chỉ trên K class của task này (local scope cho Ridge)
-        # ----------------------------------------------------------------
-        Y_local = target2onehot(train_labels - task_class_start, num_classes_per_task)
+        # Map global label → local index [0, K-1] cho Ridge Regression
+        g2l = {g: l for l, g in enumerate(actual_classes)}
+        local_labels = torch.tensor(
+            [g2l[int(lb)] for lb in train_labels.cpu().tolist()],
+            dtype=torch.long, device=device
+        )
+        Y_local = target2onehot(local_labels, num_task_classes)  # (N, K) — safe!
 
-        # TODO: RAPID - [Ridge Regression Train (Incremental Update)]
-        # Đây là nơi huấn luyện Ridge Regression theo phương pháp recursive/incremental.
-        # Q và G được cập nhật cộng dồn (sufficient statistics) qua các task.
-        # Wo = (G + ridge*I)^{-1} @ Q là nghiệm closed-form của Ridge Regression.
-        # Trong RAPID, khi expand feature space (thêm neuron mới), cần:
-        #   1. Pad Q và G cho phù hợp với kích thước mới.
-        #   2. Chỉ cập nhật các block tương ứng với neuron mới (block-incremental update).
-        # Kích thước hiện tại của feature space (current_proj_dim = t * expand_dim)
-        D = current_proj_dim
-        Q_task = torch.zeros(D, num_classes_per_task, device=device)
-        G_task = torch.zeros(D, D, device=device)
-        Q_task = Q_task + train_embeddings @ Y_local
-        G_task = G_task + train_embeddings @ train_embeddings.T
-        # Tích lũy sufficient statistics toàn cục (grow Q, G nếu cần)
-        if Q.shape[0] < D:
-            # Grow Q và G theo chiều feature khi projection_matrix mở rộng
-            Q = torch.cat([Q, torch.zeros(D - Q.shape[0], Q.shape[1], device=device)], dim=0)
-            G = torch.cat(
-                [torch.cat([G, torch.zeros(G.shape[0], D - G.shape[1], device=device)], dim=1),
-                 torch.zeros(D - G.shape[0], D, device=device)], dim=0
-            )
-        Q[:, task_class_start:task_class_end] += Q_task
-        G[:D, :D] += G_task
-        ridge = select_ridge_parameter(train_embeddings.T, Y_local, args.ridge_lower, args.ridge_upper)
-        L = torch.linalg.cholesky(G_task + ridge * torch.eye(D, device=device))  # 40% faster
-        Wo_task = torch.cholesky_solve(Q_task, L)  # (D, K) — nghiệm Ridge trên D chiều
+        # Per-task Ridge Regression (closed-form, không cần global Q/G)
+        D      = current_proj_dim
+        G_task = train_embeddings @ train_embeddings.T  # (D, D)
+        Q_task = train_embeddings @ Y_local             # (D, K)
+        ridge  = select_ridge_parameter(train_embeddings.T, Y_local, args.ridge_lower, args.ridge_upper)
+        L      = torch.linalg.cholesky(G_task + ridge * torch.eye(D, device=device))
+        Wo_task = torch.cholesky_solve(Q_task, L)       # (D, K)
         training_end = time.time()
         training_time.append(training_end - training_start)
 
-        # TODO: RAPID - [Unified Classifier: Expand & Fit]
-        # Expand W để chứa class mới, sau đó ghi nghiệm Ridge vào đúng cột.
-        classifier.expand(num_new_classes=num_classes_per_task)
-        classifier.fit(
-            Wo_task=Wo_task,
-            task_class_indices=task_class_indices,
-            train_embeddings=train_embeddings,   # (expand_dim, N)
-            train_labels=train_labels,           # global labels
-        )
+        # Ghi nghiệm Ridge vào đúng cột W (theo actual global class indices)
+        classifier.expand(num_new_classes=num_task_classes)
+        classifier.fit(Wo_task=Wo_task, task_class_indices=actual_classes)
 
         for sub_task in range(task + 1):
             test_embeddings, test_labels = feature_extract(pretrained_model, test_loader[sub_task], device)
