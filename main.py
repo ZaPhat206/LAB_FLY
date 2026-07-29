@@ -40,21 +40,28 @@ def get_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def select_ridge_parameter(Features, Y, ridge_lower, ridge_upper):
-    X = Features
-    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-    S_sq = S**2
-    UTY = U.T @ Y
+def select_ridge_parameter(Features, Y, ridge_lower, ridge_upper, G_dual_precomputed=None):
+    """
+    Chọn lambda tối ưu bằng GCV.
+    Dùng eigh(X @ X^T) thay vì SVD(X) để tránh OOM khi D >> N.
+    G_dual_precomputed: nếu đã tính sẵn X @ X^T, truyền vào để khỏi tính lại.
+    """
+    X = Features                  # (N, D)
+    N = X.shape[0]
+    G_dual = G_dual_precomputed if G_dual_precomputed is not None else X @ X.T
+    S_sq, U = torch.linalg.eigh(G_dual)
+    S_sq = S_sq.flip(0).clamp(min=0)
+    U    = U.flip(1)
+    UTY  = U.T @ Y                # (N, K)
+
     ridges = torch.tensor(10.0 ** np.arange(ridge_lower, ridge_upper), device=X.device)
-    n_samples = X.shape[0]
-    
     gcv_scores = []
     for ridge in ridges:
-        diag = S_sq / (S_sq + ridge)
-        df = diag.sum()
-        Y_hat = U @ (diag[:, None] * UTY)
-        residual = torch.norm(Y - Y_hat)**2
-        gcv = (residual / n_samples) / (1 - df / n_samples)**2
+        diag      = S_sq / (S_sq + ridge)
+        df        = diag.sum()
+        Y_hat     = U @ (diag[:, None] * UTY)
+        residual  = torch.norm(Y - Y_hat) ** 2
+        gcv       = (residual / N) / (1 - df / N) ** 2
         gcv_scores.append(gcv.item())
 
     optimal_idx = np.argmin(gcv_scores)
@@ -253,12 +260,15 @@ if __name__ == "__main__":
     #           tạo không gian (t * expand_dim) × embedding_dim.
     # Biến projection_matrix luôn là dense tensor; chuyển sang sparse khi dùng.
     non_zero_per_col = args.synaptic_degree
+    # Khởi tạo block chiếu cho Task 0: (neurons_per_task × embedding_dim)
+    # Sau khi có num_classes_per_task ở trên, dùng tạm biến neurons_per_task_init
+    _npt = args.expand_dim // args.num_tasks
     projection_matrix = _make_sparse_projection_block(
-        num_neurons=args.expand_dim,
+        num_neurons=_npt,
         embedding_dim=args.embedding_dim,
         non_zero_per_row=non_zero_per_col,
         device=device,
-    )  # Dense (expand_dim, embedding_dim) — block của Task 1
+    )  # Dense (_npt, embedding_dim) — block của Task 0
 
     acc = {}
     training_time = []
@@ -266,15 +276,18 @@ if __name__ == "__main__":
 
     # Ridge Regression dùng per-task (không cần global Q/G vì classes không sequential)
 
-    # TODO: RAPID - [Unified Classifier Init]
-    # Khởi tạo Single Unified Cosine Classifier thay thế toàn bộ per-task head.
-    # init_dim = expand_dim: số neuron ban đầu (k), W sẽ grow qua grow_projection().
-    num_classes_per_task = args.num_classes // args.num_tasks
+    # neurons_per_task: số neuron mỗi task nhận được.
+    # Tổng D sau num_tasks task = expand_dim (bằng baseline → fair comparison).
+    # VD: expand_dim=10000, num_tasks=10 → mỗi task 1000 neuron, task 9 D=10000.
+    num_classes_per_task  = args.num_classes // args.num_tasks
+    neurons_per_task      = args.expand_dim  // args.num_tasks
     classifier = UnifiedCosineClassifier(
-        init_dim=args.expand_dim,
+        init_dim=neurons_per_task,
         num_total_classes=args.num_classes,
         device=device,
     )
+    print(f"RAPID config: {neurons_per_task} neurons/task, "
+          f"total D at task-{args.num_tasks-1} = {args.expand_dim}")
     print("Start Continual Learning")
     for task in range(args.num_tasks):
         acc[task] = []
@@ -287,17 +300,16 @@ if __name__ == "__main__":
         # Đồng thời, grow W trong classifier: zero-pad m hàng mới cho class cũ.
         if task > 0:
             new_block = _make_sparse_projection_block(
-                num_neurons=args.expand_dim,
+                num_neurons=neurons_per_task,      # ← mỗi task chỉ thêm neurons_per_task hàng
                 embedding_dim=args.embedding_dim,
                 non_zero_per_row=non_zero_per_col,
                 device=device,
-            )  # (expand_dim, embedding_dim)
-            # Nối row-wise: projection_matrix: (t*k, d_in)
+            )
             projection_matrix = torch.cat([projection_matrix, new_block], dim=0)
-            # Zero-pad W trong classifier cho m chiều mới (class cũ = 0 trên chiều mới)
-            classifier.grow_projection(num_new_neurons=args.expand_dim)
-            print(f"[Task {task}] Projection expanded: {projection_matrix.shape[0]} neurons "
-                  f"| Classifier W: {classifier.current_dim} dims")
+            del new_block                          # giải phóng ngay sau khi cat
+            classifier.grow_projection(num_new_neurons=neurons_per_task)
+            print(f"[Task {task}] D = {projection_matrix.shape[0]} neurons "
+                  f"(target: {args.expand_dim} at task {args.num_tasks-1})")
 
         # Kích thước hiện tại của không gian chiếu
         current_proj_dim = projection_matrix.shape[0]  # t * expand_dim
@@ -313,58 +325,55 @@ if __name__ == "__main__":
         # Bước 1: chiếu lên không gian (current_proj_dim × d_in) — đã grow.
         # Bước 2: WTA top-k trên toàn bộ current_proj_dim neuron.
         # Lưu ý: projection_matrix là dense tensor, chuyển sang sparse khi nhân.
-        proj_sparse = projection_matrix.to_sparse_csc()  # (current_proj_dim, d_in)
-        train_embeddings = torch.sparse.mm(proj_sparse, train_embeddings.T)  # (current_proj_dim, N)
+        proj_sparse = projection_matrix.to_sparse_csc()
+        train_embeddings = torch.sparse.mm(proj_sparse, train_embeddings.T)  # (D, N)
         values, indices = train_embeddings.topk(topk_neurons, dim=0, largest=True)
         output = torch.zeros_like(train_embeddings)
         output.scatter_(0, indices, values)
-        train_embeddings = output  # (current_proj_dim, N)
+        del values, indices, train_embeddings    # giải phóng 3 tensor lớn trước khi tiếp tục
+        train_embeddings = output
 
-        # ----------------------------------------------------------------
-        # Lấy ACTUAL global class indices từ data (load_dataset dùng random.sample
-        # nên thứ tự class hoàn toàn ngẫu nhiên — KHÔNG giả định sequential)
-        # ----------------------------------------------------------------
         actual_classes   = sorted([int(c) for c in train_labels.unique().cpu().tolist()])
         num_task_classes = len(actual_classes)
-
-        # Map global label → local index [0, K-1] cho Ridge Regression
         g2l = {g: l for l, g in enumerate(actual_classes)}
         local_labels = torch.tensor(
             [g2l[int(lb)] for lb in train_labels.cpu().tolist()],
             dtype=torch.long, device=device
         )
-        Y_local = target2onehot(local_labels, num_task_classes)  # (N, K) — safe!
+        Y_local = target2onehot(local_labels, num_task_classes)
 
-        # Per-task Ridge Regression (closed-form, không cần global Q/G)
-        D      = current_proj_dim
-        G_task = train_embeddings @ train_embeddings.T  # (D, D)
-        Q_task = train_embeddings @ Y_local             # (D, K)
-        ridge  = select_ridge_parameter(train_embeddings.T, Y_local, args.ridge_lower, args.ridge_upper)
-        L      = torch.linalg.cholesky(G_task + ridge * torch.eye(D, device=device))
-        Wo_task = torch.cholesky_solve(Q_task, L)       # (D, K)
+        # Dual Ridge Regression: giải hệ (N×N) thay vì (D×D)
+        X      = train_embeddings.T                    # (N, D)
+        N_samp = X.shape[0]
+        G_dual = X @ X.T                               # (N, N) — lưu lại để dùng cho GCV
+        ridge  = select_ridge_parameter(X, Y_local, args.ridge_lower, args.ridge_upper,
+                                        G_dual_precomputed=G_dual)   # tránh tính G_dual 2 lần
+        L      = torch.linalg.cholesky(G_dual + ridge * torch.eye(N_samp, device=device))
+        alpha  = torch.cholesky_solve(Y_local, L)      # (N, K)
+        Wo_task = X.T @ alpha                          # (D, K)
+        del G_dual, L, alpha, X                        # giải phóng bộ nhớ để fit()
+        torch.cuda.empty_cache()
         training_end = time.time()
         training_time.append(training_end - training_start)
 
-        # Ghi nghiệm Ridge vào đúng cột W (theo actual global class indices)
         classifier.expand(num_new_classes=num_task_classes)
         classifier.fit(Wo_task=Wo_task, task_class_indices=actual_classes)
+        del Wo_task
 
         for sub_task in range(task + 1):
             test_embeddings, test_labels = feature_extract(pretrained_model, test_loader[sub_task], device)
-            # TODO: RAPID - [Feature Extraction via Projection (Test/Eval)]
-            # Dùng projection_matrix đã expanded (current_proj_dim × d_in).
-            # WTA top-k nhất quán với lúc train: topk_neurons trên current_proj_dim.
-            # Classifier.evaluate() nhận (current_proj_dim, N) — khớp với W.shape[0].
-            test_embeddings = torch.sparse.mm(proj_sparse, test_embeddings.T)  # (current_proj_dim, N)
+            test_embeddings = torch.sparse.mm(proj_sparse, test_embeddings.T)
             values, indices = test_embeddings.topk(topk_neurons, dim=0, largest=True)
             output = torch.zeros_like(test_embeddings)
             output.scatter_(0, indices, values)
-            test_embeddings_dense = output  # (current_proj_dim, N)
-
-            # TODO: RAPID - [Unified Classifier: Evaluate — không cần task_id]
-            # Cosine Classifier: z và W[:current_proj_dim, :seen_classes] đồng kích thước.
+            del values, indices, test_embeddings
+            test_embeddings_dense = output
             test_accuracy = classifier.evaluate(test_embeddings_dense, test_labels)
+            del test_embeddings_dense
             acc[sub_task].append(test_accuracy)
+
+        del proj_sparse, train_embeddings
+        torch.cuda.empty_cache()
 
     # display acc_matrix
     acc_matrix = [["{:.2f}".format(0.00) for _ in range(args.num_tasks)] for _ in range(len(acc))]
