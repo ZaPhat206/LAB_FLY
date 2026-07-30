@@ -1,0 +1,1593 @@
+Published as a conference paper at ICLR 2026
+FLY-CL: A FLY-INSPIREDFRAMEWORK FOREN-
+HANCINGEFFICIENTDECORRELATION ANDREDUCED
+TRAININGTIME INPRE-TRAINEDMODEL-BASEDCON-
+TINUALREPRESENTATIONLEARNING
+Heming Zou1∗ Yunliang Zang2∗ Wutong Xu1 Xiangyang Ji1†
+1Department of Automation, Tsinghua University
+2Academy of Medical Engineering and Translational Medicine, Tianjin University
+{zouhm24, xwt22}@mails.tsinghua.edu.cn
+yunliangzang@tju.edu.cn, xyji@tsinghua.edu.cn
+ABSTRACT
+Using a nearly-frozen pretrained model, the continual representation learning
+paradigm reframes parameter updates as a similarity-matching problem to miti-
+gate catastrophic forgetting. However, directly leveraging pretrained features for
+downstream tasks often suffers from multicollinearity in the similarity-matching
+stage, and more advanced methods can be computationally prohibitive for real-time,
+low-latency applications. Inspired by the fly olfactory circuit, we propose Fly-CL, a
+bio-inspired framework compatible with a wide range of pretrained backbones. Fly-
+CL substantially reduces training time while achieving performance comparable to
+or exceeding that of current state-of-the-art methods. We theoretically show how
+Fly-CL progressively resolves multicollinearity, enabling more effective similarity
+matching with low time complexity. Extensive simulation experiments across
+diverse network architectures and data regimes validate Fly-CL’s effectiveness in
+addressing this challenge through a biologically inspired design. Code is available
+athttps://github.com/gfyddha/Fly-CL.
+1 INTRODUCTION
+Artificial neural networks have exhibited remarkable capabilities across various domains in recent
+years. Nevertheless, real-world applications often require continuous model adaptation to handle
+progressively emerging unseen scenarios, making updates based on sequential incoming data essential.
+This need has led to the development of Continual Learning (CL). Earlier research primarily focused
+on training models from scratch (Aljundi et al., 2018; Kirkpatrick et al., 2017; Li & Hoiem, 2017;
+Zenke et al., 2017). Pretrained models have recently become prominent in CL, owing to their robust
+generalization in downstream tasks for downstream tasks (Wang et al., 2022a;b; Zou et al., 2025b).
+Popular CL methods utilizing pre-trained models can generally be classified into three categories:
+(1) prompt/adapter-based approaches (Jung et al., 2023; Smith et al., 2023; Tang et al., 2023; Wang
+et al., 2022a;b; 2025a; Liang & Li, 2024; Yu et al., 2024; Xiao et al., 2025; Wang et al., 2024b;
+2025c), (2) mixture-based approaches (Chen et al., 2023; Gao et al., 2023; Wang et al., 2023a;b;
+Zhou et al., 2023b; Che et al., 2025), and (3) representation-based approaches (McDonnell et al.,
+2023; Sun et al., 2025; Zhou et al., 2023a; 2024; Zhuang et al., 2024). All three paradigms operate
+without exemplars and significantly outperform traditional training-from-scratch methods. Despite
+their strengths, each approach has limitations. Prompt/adapter-based methods are constrained to trans-
+former architectures, and updating prompts/adapters inherently risks propagating forgetting within
+the prompt/adapter space. Mixture-based approaches require storing previous models, resulting in
+significant storage overhead and increased computational complexity during model fusion. Compared
+with parameter-learning approaches,representation-based methods perform better by reframing
+∗Equal contribution
+†Corresponding author
+1
+Published as a conference paper at ICLR 2026
+learning as similarity matching and avoiding dependence on a specific backbone. They form
+class prototypes (CPs) by averaging features extracted by a frozen pretrained network, with each
+prototype acting as the centroid of its class. However,insufficient separation between features can
+lead to ambiguous decision boundaries when distinguishing between prototypes, complicating
+the similarity matching process. This challenge is formally recognized as the multicollinearity
+problem. Previous studies (McDonnell et al., 2023) have attempted to address this issue, but they still
+incur substantial computational costs, hindering real-world deployment.
+Figure 1:Schematic of the Fly Olfactory Circuit.Odors are first detected and pre-processed by
+olfactory receptor neurons (ORNs) in the antennal lobe, where feature extraction and normalization
+take place, before being transmitted to projection neurons (PNs). Expansion coding occurs as signals
+move from PNs to Kenyon cells (KCs), with an expansion ratio of approximately 40. Each KC
+connects to a fixed number of PNs (about 6). Lateral inhibition, mediated by an anterior paired
+lateral (APL) neuron, suppresses most weakly activated KCs, exemplifying a winner-take-all strategy.
+Finally, signals from KCs to mushroom body output neurons (MBONs) involve a dense down-
+projection that reduces dimensionality to select specific actions.
+In biological systems, pattern separation is a well-recognized circuit motif across cerebellum-like
+and related networks, including the cerebellum, hippocampus, and fly olfactory system (Lin et al.,
+2014; Papadopoulou et al., 2011; Stevens, 2015; Zang & De Schutter, 2023). These neural circuits
+efficiently decorrelate overlapping sensory inputs. Figure 1 illustrates the information processing
+mechanism in the fly olfactory circuit. The process unfolds in several steps: in response to an odor
+stimulus, olfactory neurons extract and pre-process odor information represented as a 50-dimensional
+vector (PNs). These pre-extracted features are then randomly projected into expanded dimensions
+(KCs), selectively activating a small subset of KCs that receive the strongest excitation while zeroing
+out others. The high-dimensional features in KCs subsequently converge to low-dimensional MBONs
+for classification. Numerous studies have highlighted the role of the PN →KC transformation in
+producing decorrelated representations, and many strategies have been proposed to model this
+process. By contrast, the downstream KC→MBON transformation has received far less attention,
+and a clear theory of its contribution to decorrelation has yet to be established. To address this gap,
+we theoretically show that the KC →MBON pathway also supports decorrelation under the
+Hebbian learning rule by demonstrating its consistency with ridge classification (See Section 6).
+Inspired by the fly olfactory circuit, we propose Fly-CL, an efficient framework for progressive
+decorrelation in representation-based learning with pre-trained models. The pipeline starts with
+feature extraction and normalization, followed by high-dimensional random sparse projection and a
+top-koperation for collective decorrelation, mimicking the PN→KC process. We then implement a
+prototype similarity matching mechanism mimicking the KC→MBON structure during inference,
+and an efficient streaming ridge classification method to decorrelate parameter weights during training.
+Empirical results show substantially reduced time consumption versus baseline methods.
+Our main contributions are as follows:
+1. We propose an efficient and biologically plausible decorrelation framework that significantly
+reduces computational costs compared to current SOTA methods while achieving comparable or
+improved performance in CL.
+2. Our method’s effectiveness and robustness in decorrelation are validated by extensive experiments
+under various data setups and model architectures, supported by theoretical and empirical analyses.
+2
+Published as a conference paper at ICLR 2026
+3. The alignment of our framework with the fly olfactory circuit suggests that biological structures
+can inspire effective and efficient solutions to AI problems.
+2 RELATEDWORK
+Representation-based methods in CL using Pre-trained Models:Representation-based methods
+(McDonnell et al., 2023; Sun et al., 2025; Zhou et al., 2023a; 2024) demonstrate superior performance
+over parameter-learning approaches by leveraging features extracted from a frozen pre-trained model
+to compute similarities with class prototypes. They are also more practical for resource-constrained
+deployments (e.g., edge computing), since they avoid updating the entire model. For instance, in a
+smart camera system, such methods enable the efficient addition of new object recognition capabilities
+without retraining the entire model. While showing promising progress, their computational overhead
+remains substantial, which may limit their applicability in scenarios requiring real-time responses.
+Fly Olfactory Circuit:Information processing in cerebellum-like circuits, including the fly olfac-
+tory circuit, involves several stages (Lin et al., 2014; Papadopoulou et al., 2011; Stevens, 2015; Zang
+& De Schutter, 2023). Theoretical neuroscience studies suggest that most stages exhibit progressive
+feature separation effects (Hige et al., 2015). Algorithms inspired by the fly olfactory circuit have
+been applied across various AI domains, including parameter-efficient fine-tuning (Zou et al., 2025c),
+continual learning (Zou et al., 2025b), locality-sensitive hashing (Dasgupta et al., 2017; Sharma &
+Navlakha, 2018), word embedding (Liang et al., 2021), and federated learning (Ram & Sinha, 2022).
+3 BACKGROUND
+3.1 PROBLEMSTATEMENT
+In this paper, we focus on CL within the context of image classification tasks. We denote sequentially
+arriving tasks as D={D 1, . . . ,DT }, where each task Dt ={(x i
+t, yi
+t)}nt
+i=1 consists of nt samples.
+Each sample xi
+t within a task is drawn from the input spaceXt, and its corresponding label yi
+t belongs
+to the label space Yt with ct classes. The training process involves sequential learning from D1 to
+DT , followed by class prediction on an unseen test set spanning the full label space.
+To demonstrate the effectiveness and efficiency of our framework, we adopt Class Incremental
+Learning (CIL), a widely used experimental setup. Unlike traditional Task Incremental Learning,
+CIL does not provide access to the task ID during the testing process, making it more challenging. In
+CIL, the model learns mutually exclusive classes within each task, ensuring that the intersection of
+label spaces satisfiesY i ∩ Yj =∅. We denote that there arec t classes for the firstttasks.
+3.2 REPRESENTATION-BASED PARADIGM INCL
+We study on the basis of the recently popular representation-based paradigm using pre-trained models
+(McDonnell et al., 2023; Sun et al., 2025; Zhou et al., 2023a; 2024), which demonstrates superior
+performance for CL. Given an input image xi
+t, it is first compressed into a d-dimensional feature
+vi
+t =f θ(xi
+t)∈R d using a pre-trained encoder fθ. For each class i in task t, we compute its prototype
+by averaging features over all training samples belonging to this class:
+µi
+t = 1
+N i
+t
+|Dt|X
+j=1
+I(yj
+t =i)f θ(xj
+t )∈R d,(1)
+where N i
+t = P|Dt|
+j=1 I(yj =i) denotes the cardinality of class i’s training set, and I(·) is the indicator
+function. During inference, for a test sample with feature vector v, the predicted class ˆyis determined
+by finding the maximum cosine similarity betweenvand all learned class prototypes:
+ˆy= arg max
+t,i
+v⊤µi
+t
+∥v∥ · ∥µi
+t∥ .(2)
+However, significant inter-prototype correlations (E[µct,i⊤
+ti µct,j
+tj ]≫0 , see Figure 3(a)), can severely
+compromise the discriminative power of the similarity measurement (Belsley et al., 2005). This
+phenomenon arises because high correlations reduce the effective angular separation between classes
+3
+Published as a conference paper at ICLR 2026
+in the embedding space, leading to ambiguous decision boundaries. Specifically, when prototypes
+cluster near a dominant direction in Rd, the cosine similarity metric becomes less sensitive to subtle
+but critical inter-class distinctions, thereby degrading classification performance.
+4 FLY-CL
+In this section, we detail the design motivation and functionality of each component of our Fly-CL
+framework. A schematic of the overall framework is provided in Figure 2, along with the pseudocode
+for the training and inference pipeline in Appendix A. The decorrelation effect of each component is
+visualized in Figure 3 using Pearson correlation coefficients of different class prototypes.
+Figure 2:Schematic of the Fly-CL Framework. Left:Our framework extracts image embeddings
+using a frozen pre-trained model, projects them into a higher-dimensional space via a fixed sparse
+random projection, and filters them through a top- k operation (PNs → KCs). Then we utilize a
+learned down-projection for similarity matching during inference time (KCs → MBONs).Right:
+During the training phase, the parameterC t is learned via a streaming ridge classification scheme.
+4.1 SPARSERANDOMPROJECTION ANDTOP-KOPERATION
+Building upon the representation-based paradigm, it is necessary to decouple different class prototypes.
+Inspired by the decorrelation mechanism of the fly olfactory circuit, we emulate the sparse expansion
+projection from PNs to KCs, followed by winner-take-all inhibition mediated by APL neurons. Given
+a feature embedding v∈R d extracted from the pre-trained encoder, we formulate the transformation
+Z(v) :R d →R m as:
+h′ =Z(v) =top-k(h) =top-k(W v),(3)
+where the fixed projection matrix W∈R m×d (with m≫d ) implements weight sparsity: each row
+contains exactly p (p < d) non-zero entries independently sampled from N(0,1) . The top-k operator
+implements activation sparsity by preserving only the k largest components (k < m)while zeroing
+out others, formally defined as:
+[h′]i =
+[h]i if the magnitude of[h] i is among the top-kvalues ofh,
+0otherwise. (4)
+This two-stage process achieves effective decorrelation through the following properties, and its
+empirical effect is visualized in the transformation from Figure 3(a) to (b).
+1.High-Dimensional Embedding Enhances Linear Separability: Random projection of low-
+dimensional features into an extremely high-dimensional space can improve the linear separability of
+the feature representations (Litwin-Kumar et al., 2017).
+2.Powerful Inhibition Suppresses Noisy Components: The top- k operation imposes sparsity by
+suppressing noisy dimensions that may interfere with discrimination through dimensional competition,
+while enhancing separation by keeping the most discriminative dimensions (Metwally et al., 2006).
+Considering computational efficiency, W ’s sparse pattern reduces the time complexity for random
+projection from O(mntd) to O(mntp) while preserving the core representational capacity compared
+to dense projection. Similarly, the top- k operation reduces similarity matching complexity from
+O(mntct)toO(kn tct), while simultaneously improving performance.
+4
+Published as a conference paper at ICLR 2026
+(a) After feature extraction
+ (b) After random projection
+ (c) After similarity matching
+Figure 3:Pearson Correlation Coefficients of Prototypes at Different Decorrelation Stages in
+Fly-CL.Heatmaps display Pearson correlation coefficients for 10 randomly selected class prototypes
+at each stage of our pipeline (consistent across visualizations).
+We further propose two theorems to demonstrate that strong sparsity does not significantly degrade
+performance. According to Theorem 4.1, as long as p and d are not extremely small, the matrix W
+retains full column rank with probability 1−o(1) , which is a common approach to demonstrate that
+a sparse random projection does not result in severe information loss. Furthermore, in Theorem 4.2,
+by proving that the performance degradation between this sparsification operation and the original
+vector is bounded, we show that ifkis not extremely small, it can preserve most of its performance.
+For a complete proof, please refer to Appendix B.
+Theorem 4.1.Given the matrix W∈R m×d, where m > d, with each row having exactlyp non-zero
+entries, which are randomly sampled from N(0,1) . Let W ∈Rd×d be any square submatrix of W .
+Then, for anyϵ >0, it holds that
+P
+
+|det(W)| ≥
+ p
+d
+d/2 √
+d! exp(−d1/2+ϵ)
+
+= 1−o(1).
+Thus, for sufficiently large p and d, any submatrix W is invertible with probability at least 1−o(1) .
+Theorem 4.2.For top- k sparsification in the expanded dimension m, the performance degradation
+is bounded by:
+E[|L(h, y)−L(h ′, y)|]≤M·
+r
+C
+k ·E[∥h∥ 2
+2],
+where L(·) is a performance loss function for downstream tasks and C, M are constants. To ensure
+negligible performance degradation, we require:
+r
+C
+k ·E[∥h∥ 2
+2]≤ O
+ 1√
+mα
+
+,
+i.e., when k= Ω(m α) (0< α <1), the error bound decays polynomially with increasing dimension.
+4.2 STREAMINGRIDGECLASSIFICATION
+Previous studies on decorrelation in the fly olfactory circuit have primarily focused on PNs→KCs
+transformation, where sparse and decorrelated representations have been experimentally observed. In
+contrast, the downstream KCs→MBONs transformation has received little attention, and the physio-
+logical evidence remains inconclusive. This motivates us to investigate whether the KC→MBON
+pathway also facilitates decorrelation. To simulate the training dynamics of the KC→MBON projec-
+tions, we employ a biologically plausible Hebbian learning rule. As shown in Section 6, this rule is
+mathematically equivalent to ridge classification under the CL setting. Consequently, we implement
+an online formulation with adaptive regularization, which naturally achieves decorrelation while
+ensuring computational efficiency and compatibility with sequential data. Ridge classification (Hoerl
+& Kennard, 1970) mitigates feature collinearity through ℓ2-regularization, trading increased bias for
+reduced variance by shrinking correlated feature weights, thereby stabilizing prototype estimation
+in non-i.i.d. sequential learning scenarios. Let Ht ∈R nt×m denote the concatenation of high-
+dimensional features h′ for nt samples in task t, and Yt ∈ {0,1}nt×ct represent the corresponding
+one-hot label matrix for ct classes. We maintain two streaming statistics: a Gram matrix G∈R m×m,
+5
+Published as a conference paper at ICLR 2026
+capturing self-correlation, and a matrix S∈R m×ct, accumulating cross-dimensional weights for
+each class prototype. During each task iterationt, these are updated as follows:
+Gt ←G t−1 +H ⊤
+t Ht,S t ←S t−1 +H ⊤
+t Yt.(5)
+The classifier matrixC∈R m×ct is updated via regularized least squares accordingly:
+Ct = (Gt +λI m)−1St.(6)
+Prediction for preprocessed new samplesh ′ ∈R m follows:
+ˆy= arg max
+i∈{1,...,ct}
+h′⊤C·,i,(7)
+whereC ·,i denotes thei-th column of modulated prototypes.
+Adaptive Regularization: Due to the inherent heterogeneity of different tasks, a fixed penalty
+coefficients λ will cause suboptimal performance. For adaptive regularization, vanilla λ selection via
+grid search and cross-validation incurs prohibitive computational costs of O(lm3) for l candidates
+where the expanded feature dimension m is extremely large (McDonnell et al., 2023). To achieve our
+efficiency desideratum, we draw inspiration from an adaptive Generalized Cross-Validation (GCV)
+(Golub et al., 1979) framework that analytically approximates cross-validation error without explicit
+validation steps that require calculating large matrix inverses.
+Given new task data Ht ∈R nt×m, we first obtain its singular value decomposition (SVD) as
+Ht =U tΣtV ⊤
+t , where Ut ∈R nt×r and Vt ∈R m×r are semi-orthogonal column matrices that
+satisfy U ⊤
+t Ut =I r, V ⊤
+t Vt =I r, and Σt = diag(s1, . . . , sr)∈R r×r contains non-zero singular
+values with r= rank(H t) = min(nt, m)(typically full rank due to numerical precision). The SVD
+time complexity is O(ntrm). For l candidate regularization coefficients λ∈Λ ={λ min, . . . , λmax}
+on a log scale, we use the following steps to compute the GCV criterion for each one:
+First, inO(lr)time, we get the shrinkage matrix and calculate the effective degrees-of-freedom by:
+Dt = Σ2
+t
+Σ2
+t +λI r
+,df(λ) = tr(D t) =
+rX
+i=1
+s2
+i
+s2
+i +λ .(8)
+Then, we reconstruct the prediction value of ridge regression inO(ln trct)time by
+ˆYt =U t(vecdiag(Dt)⊗1 ⊤
+c )⊙U ⊤
+t Yt,(9)
+where ⊗ denotes the outer product, ⊙ denotes the Hadamard product, and vecdiag extracts the
+diagonal elements into a column vector. Finally, we obtain the GCV value by
+GCV(λ) = ∥Yt − ˆYt(λ)∥2
+F
+nt
+
+1− df(λ)
+nt
+2 ,(10)
+with time complexity beingO(ln tct). The optimal regularization parameter is then selected by:
+λ∗
+t = arg min
+λ∈Λ
+GCV(λ).(11)
+Considering the projected dimension m is extremely large, we make the mild assumption that
+m > nt, and lct ≪m , thus r= min(n t, m) =nt. The original l loop complexity is O(lntrct) =
+O(ln2
+t ct)≪ O(n2
+t m) =O(n trm). Hence, the time complexity is determined by SVD, at O(n2
+t m).
+Compared to vanilla cross-validation takingO(lm 3), the time consumption is greatly reduced.
+Accelerated Prototype Calculation: Upon determining the optimal regularization parameter λ
+through GCV , we solve Eq. 6 to obtain class prototypesCt. While vanilla matrix inversion via LU
+decomposition provides a baseline implementation, for the sake of computational efficiency, we
+exploit the inherent positive-definiteness of Gt +λ tIt to achieve computational acceleration through
+Cholesky factorization by:
+LtL⊤
+t =G t +λ ∗
+t Im,C t =L −⊤
+t (L−1
+t St),(12)
+where Lt denotes the lower-triangular Cholesky factor. This approach reduces theoretical complexity
+from O( 2
+3 m3) to O( 1
+3 m3) for factorization, with triangular solves requiring half the FLOPs of
+general linear system solutions. The numerical stability of this method is ensured by the condition
+number bound κ(Lt)≤κ(G t +λ ∗
+t Im), making it particularly suitable for ill-conditioned streaming
+scenarios where Gt may accumulate numerical noise over tasks. The decorrelation effect of the
+streaming ridge classification is visualized via the transformation from Figure 3(b) to (c).
+6
+Published as a conference paper at ICLR 2026
+Table 1:Performance Comparison on Pre-trained ViT-B/16 Models.We report the average
+training time per task (τtrain), average post-extraction training time (τpost), and overall accuracy ( ¯A)
+across three benchmark datasets: CIFAR-100, CUB-200-2011, and VTAB.
+Method CIFAR-100 CUB-200-2011 VTAB
+τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑)
+L2P 263.54±0.10183.56±0.3687.74±0.4652.02±0.0437.03±0.0777.48±1.4342.10±0.0436.45±0.0281.24±0.67
+DualPrompt231.89±0.63153.66±0.4787.47±0.5846.28±0.0531.64±0.0679.89±1.4438.14±0.1631.64±0.0680.85±1.34
+InfLoRA 220.82±0.44140.31±0.4191.10±0.3645.31±0.1930.97±0.2280.65±0.7335.80±0.2829.26±0.1788.73±0.57
+SEMA 241.60±0.82160.87±0.6992.04±0.2548.21±0.2332.96±0.2084.31±0.3745.50±0.1339.82±0.2691.18±0.46
+MoE-Adapter187.91±0.61106.37±0.5390.43±0.4637.89±0.1522.61±0.1279.65±0.3232.28±0.1926.06±0.1486.39±0.77
+EASE 621.26±1.05583.4±0.7692.96±0.25138.78±0.36122.48±0.2789.56±0.43108.35±0.9794.73±1.1194.02±0.15
+RanPAC 98.62±0.4284.42±0.4494.21±0.1137.95±0.1533.83±0.1392.67±0.2063.68±0.1861.44±0.1794.16±0.32
+F-OAL 71.05±0.2357.13±0.1991.96±0.296.24±0.092.04±0.0591.13±0.15 3.19±0.051.03±0.0294.68±0.32
+Fly-CL 19.07±0.075.38±0.0193.89±0.124.43±0.11 0.35±0.0193.84±0.182.48±0.13 0.34±0.0396.54±0.38
+5 EXPERIMENTS
+5.1 EXPERIMENTALSETUP
+Datasets and Backbones:We conduct experiments using various architectures, including
+transformer-based and CNN-based backbones. Specifically, we utilize the Vision Transformer
+(ViT-B/16) (Dosovitskiy et al., 2020) and ResNet-50 (He et al., 2016) as representative architectures.
+We test our method on five widely used datasets: CIFAR-100 (Krizhevsky et al., 2009), CUB-200-
+2011 (Wah et al., 2011), VTAB (Zhai et al., 2019), ImageNet-R (Hendrycks et al., 2021a), and
+ImageNet-A (Hendrycks et al., 2021b). Further details of the data setup are provided in Appendix E.
+Baselines:We compare Fly-CL against eight baselines, including two prompt-based approaches:
+L2P (Wang et al., 2022b) and DualPrompt (Wang et al., 2022a), three lora/adapter-based approaches:
+InfLoRA (Liang & Li, 2024), SEMA (Wang et al., 2025a), and MoE-Adapter (Yu et al., 2024),
+as well as three representation-based methods: EASE (Zhou et al., 2024), RanPAC (McDonnell
+et al., 2023), and F-OAL (Zhuang et al., 2024). In Fly-CL, we find that applying data normalization
+according to the specific combination of backbone and dataset is beneficial; a detailed analysis can be
+found in Appendix C.3. For a fair comparison, all baselines use the same data normalization strategy
+as Fly-CL. Comparisons among the different baselines and implementation details are provided in
+Appendices D and E, respectively.
+Evaluation Metrics:To assess CL performance, we employ four metrics: average accuracy ( At),
+last stage accuracy (AT ), backward transfer (BW T), and overall accuracy ( ¯A). The average accuracy
+at stage t is defined as: At = 1
+t
+Pt
+i=1 at,i, where at,i denotes the test accuracy on the i-th task after
+training on the t-th task. Specially, we refer to the average accuracy at the last stage T as the last
+stage accuracy (AT ). The backward transfer is denoted as BW T= 1
+t−1
+PT
+i=1(at,i −a i,i). The
+overall accuracy is computed as the mean of At across all T tasks: ¯A= 1
+T
+PT
+i=1 At. To evaluate
+computational efficiency, we introduce two time-related metrics: average training time per task
+(τtrain) and average post-extraction training time (τpost). Here, τtrain represents the total training time
+amortized across all tasks, while τpost is derived by subtracting the average feature extraction time
+for each task (using the pre-trained model) from τtrain. τpost is a more precise metric for evaluating
+algorithm-specific time consumption, as it excludes the shared preprocessing overhead. 1
+5.2 LOWLATENCY ANDHIGHACCURACY
+The main CL results across various datasets, architectures, and task settings are summarized in Tables
+1, 2, and 5. Our framework’s key strength is achieving CL accuracy comparable to or exceeding SOTA
+performance with significantly lower computational costs, as measured by both τtrain and τpost. In
+Table 1, using ViT-B/16, Fly-CL reducesτpost by 91% on CIFAR-100 with only a marginal accuracy
+drop of 0.32% compared to SOTA methods. On CUB-200-2011 and VTAB, Fly-CL achieves83%
+and 67% reductions in τpost versus the most efficient baseline while improving overall accuracy by
+1τtrain andτ post are measured in seconds (wall clock time);A t and ¯Aare measured in %.
+7
+Published as a conference paper at ICLR 2026
+Table 2:Performance Comparison on Pre-trained ResNet-50 Models.We report the average
+training time per task (τtrain), average post-extraction training time (τpost), and overall accuracy ( ¯A)
+across three benchmark datasets: CIFAR-100, CUB-200-2011, and VTAB. The best results are
+highlighted inbold.
+Method CIFAR-100 CUB-200-2011 VTAB
+τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑)
+RanPAC55.68±0.9746.65±0.8882.72±0.2258.74±0.8454.35±0.9978.72±0.4050.15±0.3647.94±0.3892.80±0.40
+F-OAL 80.74±0.3571.78±0.3566.63±0.715.19±0.091.69±0.0160.84±1.67 2.76±0.030.55±0.0126.15±2.50
+Fly-CL 14.28±0.045.25±0.01 84.61±0.16 3.90±0.31 0.44±0.08 80.25±0.10 2.53±0.10 0.34±0.02 94.00±0.15
+Table 3:Performance Comparison on Pre-trained ViT-B/16 Models using Online Learning
+Setting. ◦ denotes methods in online mode. We report the average training time per task ( τtrain),
+average post-extraction training time (τpost), and overall accuracy (¯A) across three benchmark datasets:
+CIFAR-100, CUB-200-2011, and VTAB. The best results are highlighted inbold.
+Method CIFAR-100 CUB-200-2011 VTAB
+τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑)
+RanPAC◦ 1236.74±1.361223.56±1.0792.48±0.31242.54±1.56238.36±1.4791.89±0.26122.89±0.46120.69±0.4293.41±0.57
+F-OAL◦ 164.58±0.71151.27±0.6491.48±0.4231.34±0.3227.20±0.2891.60±0.2211.49±0.149.47±0.1695.28±0.21
+Fly-CL◦ 25.46±0.32 12.57±0.2692.96±0.146.44±0.08 2.33±0.0592.59±0.133.17±0.05 1.09±0.0496.38±0.24
+1.17% and 2.38% over the best-performing methods, respectively. In Table 2, with ResNet-50, Fly-CL
+improves overall accuracy by 1.89%, 1.53%, and 1.20% on CIFAR-100, CUB-200-2011, and VTAB,
+respectively, while reducing τpost by 93%, 74%, and 38% versus the most efficient baselines. These
+improvements align with transformer-based backbone trends. Notably, F-OAL exhibits significant
+performance degradation on CNN backbones, presumably due to error accumulation in its iterative
+update mechanism, but Fly-CL does not suffer from this issue. These results highlight Fly-CL’s
+ability to balance computational efficiency and accuracy across diverse CL scenarios, demonstrating
+its robustness. Results on datasets with severe domain shifts are presented in Table 6.
+Additionally, the time difference between τtrain and τpost in Tables 1 and 2 indicates that feature
+extraction becomes the dominant time consumer in Fly-CL. For a fair comparison with the baselines,
+we do not apply additional acceleration techniques here. However, in practical applications, tech-
+niques like model quantization (e.g., INT8) can further reduce feature extraction time by around 4×
+without significant accuracy degradation, thereby enhancing the speedup ratio. For hardware-specific
+deployment, frameworks like TVM (Chen et al., 2018) can be utilized to maximize efficiency.
+Furthermore, Fly-CL can be easily adapted to Online CL setups by updating the G and S matrices
+and solving Eq. 6 for each batch, without concatenating all batch embeddings within a task. The
+results in Table 3 indicate that batch-mode Fly-CL remains superior to other baselines in training
+time and is also competitive in accuracy.
+5.3 FACTORSCONTRIBUTING TOCOMPUTATIONALSPEEDUP
+Our analysis in Sections 4.1 and 4.2 demonstrates that the proposed framework achieves significant
+speedup over the vanilla implementation through component-level optimizations. To quantify these
+improvements precisely, we split the post-extraction training time into three key components (as
+illustrated in Figure 2) and evaluate Fly-CL against its vanilla implementation under the CUB-200-
+2011 setting in Table 4. The components include: (1) Random Projection: Acceleration via weight
+sparsity induced by sparse projection versus the dense version. (2) Ridge Selection: Time reduction
+achieved by GCV , which eliminates the need for explicit cross-validation. (3) Prototype Calculation:
+Optimization from LU decomposition to Cholesky factorization. Additionally, the inference stage
+also benefits from the activation sparsity induced by the top-koperation in similarity comparisons.
+5.4 ABLATIONSTUDY ANDHYPERPARAMETERSENSITIVITYANALYSIS
+Using ViT-B/16 as the backbone, we conduct ablation studies by individually removing the projection
+layer (w/o proj), the streaming ridge classification (w/o ridge), and the data normalization components
+8
+Published as a conference paper at ICLR 2026
+Table 4:Time Savings for Post-Extracting Components on CUB-200-2011.We compare the theo-
+retical time complexity per task (Ttheory) and the actual runtime per task (Tactual) for each component
+on an NVIDIA GeForce RTX 3090 GPU. The optimized implementations demonstrate significant
+speedups across all components.
+Method Random Projection Ridge Selection Prototype Calculation Similarity Comparison
+Ttheory Tactual Ttheory Tactual Ttheory Tactual Ttheory Tactual
+vanilla O(mntd)0.22±0.03 O(lm3)7.34±0.12 O(2
+3m3)0.20±0.01 O(mntct)0.21±0.01
+optimized O(mntp) 0.08±0.02 O(mn2
+t ) 0.14±0.01 O(1
+3m3) 0.10±0.01 O(kntct) 0.08±0.01
+(w/o norm). The results in Figure 4 demonstrate that each component contributes significantly to
+overall performance. Removing any of these components, or all of them (w/o all), leads to noticeable
+performance degradation.
+We also analyze the sensitivity of the key hyperparameters in Fly-CL: m (projection dimension),
+p (weight sparsity), and k (activation sparsity) in Figure 5. Increasing m improves accuracy, with
+performance saturating beyond m= 10,000 . Notably, Fly-CL does not suffer from the curse of
+dimensionality, which can be attributed to the fact that random projection into a higher-dimensional
+space preserves pairwise distances between data points, as guaranteed by the Johnson-Lindenstrauss
+Lemma (Johnson et al., 1984). CL performance increases monotonically with p, and no significant
+performance drop occurs as long as p does not take an excessively small value. A sufficiently large
+k value avoids information loss, while a smaller value suppresses noisy dimensions. Thus, finding
+an appropriate trade-off can lead to optimal accuracy. Encouragingly, Figure 5(c) shows a broad
+plateau for optimal k selection. Based on our empirical results, we set m= 10,000 , p= 300 , and
+k= 3,000as default values.
+10 20 30 40 50 60 70 80 90 100
+number of classes
+75
+80
+85
+90
+95
+100
+average accuracy (%)
+Fly-CL
+w/o proj
+w/o ridge
+w/o norm
+w/o all
+(a) CIFAR-100
+10 20 30 40 50 60 70 80 90 100
+number of classes
+80
+85
+90
+95
+100
+average accuracy (%)
+Fly-CL
+w/o proj
+w/o ridge
+w/o norm
+w/o all (b) CUB-200-2011
+10 20 30 40 50
+number of classes
+75
+80
+85
+90
+95
+100
+average accuracy (%)
+Fly-CL
+w/o proj
+w/o ridge
+w/o norm
+w/o all (c) VTAB
+Figure 4:Accuracy Curves from Ablation Studies on Three Datasets.We report average accuracy
+(At) for each stage. w/o refers to the removal of the specific component.
+(a) Expanded dimm
+ (b) Sparsity levelp
+ (c) Coding levelk
+Figure 5:Sensitivity Analysis for Expanded dim m, Weight Sparsity p, and Activation Sparsity
+k on CUB-200-2011.We report average accuracy in last task ( AT ) and overall accuracy ( ¯A). The
+dots denote the default values we use across experiments.
+9
+Published as a conference paper at ICLR 2026
+6 DISCUSSION: CONSISTENCY BETWEENRIDGECLASSIFICATION AND
+HEBBIANLEARNINGRULESUNDERCONTINUALLEARNING
+In this section, we demonstrate that a biologically plausible local learning rule, constructed from
+Hebbian and anti-Hebbian plasticity (Hebb, 2005), converges to the same stationary point as ridge
+classification. This equivalence provides a theoretical bridge between the synaptic dynamics in the
+KC→MBON pathway and the streaming ridge classification algorithm employed in Fly-CL.
+We begin by defining a synaptic update rule that depends only on variables locally available at each
+synapse. Let h′ ∈R m denote the pre-synaptic activity vector and ˆy=C ⊤
+t h′ the post-synaptic
+response predicted by the current weightsC t ∈R m×ct. The synaptic update is defined as:
+∆C=C t+1 −C t =η
+ 
+h′y⊤ −h ′ ˆy⊤ −λC t
+
+,(13)
+where η >0 is a small learning rate, y∈R ct is the one-hot ground-truth label. This rule consists of
+three biologically meaningful components:
+1. Hebbian term h′y⊤, which strengthens synapses when both pre-synaptic activity and the
+target post-synaptic signal co-activate.
+2. Anti-Hebbian term −h′ ˆy⊤, which suppresses correlations between the input and the
+model’s own prediction, implementing an error-correcting mechanism.
+3.Weight decay−λC t, corresponding to metabolic cost or homeostatic constraints.
+This formulation is biologically plausible: it requires only pre-synaptic activity, post-synaptic activity,
+and a modulatory teaching signal, constituting a standard three-factor learning rule commonly
+observed in neuromodulated plasticity.
+Taking the expectation over data samples(h ′,y), we obtain:
+E[∆C] =η
+ 
+E[h′y⊤]−E[h ′ ˆy⊤ ]−λC t
+
+=η
+ 
+St −G tCt −λC t
+
+,(14)
+where we define
+Gt =E[h ′h′⊤]∈R m×m,S t =E[h ′y⊤]∈R m×ct .
+Thus, the expected synaptic dynamics follow the linear recursion:
+Ct+1 =C t +η
+ 
+St −(G t +λI m)Ct
+
+.(15)
+Taking the continuous-time limitη→0yields the ordinary differential equation:
+dCt
+dt =κ
+ 
+St −(G t +λI m)Ct
+
+,(16)
+whereκ >0rescales time. The stationary solution satisfies:
+(Gt +λI m)C ⋆
+t =S t,
+and therefore:
+C ⋆
+t = (Gt +λI m)−1St,(17)
+which is exactly the closed-form solution of ridge regression.
+In our representation-based CIL setting, since all samples in the same task are available simultaneously,
+we do not need to integrate the continuous-time dynamics in Eq. 16. Instead, we can directly compute
+the ridge solution to obtain the optimal stationary classifier.
+7 CONCLUSION
+In this work, inspired by the decorrelation mechanism in the fly olfactory circuit, we propose an
+efficient CL framework, Fly-CL. Fly-CL significantly reduces computational overhead during training
+while achieving competitive performance compared to SOTA methods. This framework integrates
+several key components: data normalization, feature extraction, sparse random projection with
+top-k operation, and streaming ridge classification, each contributing to the overall efficiency and
+effectiveness of the system. Ultimately, this work demonstrates that neurobiological principles,
+particularly sparse coding and progressive decorrelation, can effectively address the efficiency-
+accuracy trade-off in artificial continual learning systems.
+10
+Published as a conference paper at ICLR 2026
+ACKNOWLEDGMENTS
+This work was supported by the Fundamental and Interdisciplinary Disciplines Breakthrough Plan of
+the Ministry of Education of China (JYB2025XDXM503).
+ETHICSSTATEMENT
+This research strictly complies with the ICLR Code of Ethics. Our empirical evaluations are conducted
+exclusively on standard, publicly accessible benchmarks, entirely free of personal, sensitive, or
+human-derived information. All data usage respects the original licenses, and we foresee no negative
+societal impacts regarding privacy, security, or algorithmic bias. Furthermore, by advancing efficient
+continual learning, Fly-CL contributes to sustainable and green AI development by significantly
+reducing the computational footprint and energy consumption typically required for retraining models
+from scratch.
+REPRODUCIBILITYSTATEMENT
+The theoretical proofs for our theorems are provided in Appendix B. Full details regarding the
+experimental setup, covering datasets, benchmarks, model configurations, evaluation metrics, and
+hyperparameters, are outlined in Section 5 and Appendix E. To ensure reproducibility, we rely
+exclusively on publicly accessible datasets and have made the complete source code available.
+REFERENCES
+Rahaf Aljundi, Francesca Babiloni, Mohamed Elhoseiny, Marcus Rohrbach, and Tinne Tuytelaars.
+Memory aware synapses: Learning what (not) to forget. InProceedings of the European conference
+on computer vision (ECCV), pp. 139–154, 2018.
+Shuai Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wenbin Ge, Sibo Song, Kai Dang, Peng Wang,
+Shijie Wang, Jun Tang, et al. Qwen2. 5-vl technical report.arXiv preprint arXiv:2502.13923,
+2025.
+Peter L Bartlett and Shahar Mendelson. Rademacher and gaussian complexities: Risk bounds and
+structural results.Journal of Machine Learning Research, 3(Nov):463–482, 2002.
+David A Belsley, Edwin Kuh, and Roy E Welsch.Regression diagnostics: Identifying influential data
+and sources of collinearity. John Wiley & Sons, 2005.
+Chang Che, Ziqi Wang, Pengwan Yang, Qi Wang, Hui Ma, and Zenglin Shi. Lora in lora: Towards
+parameter-efficient architecture expansion for continual visual instruction tuning.arXiv preprint
+arXiv:2508.06202, 2025.
+Haoran Chen, Zuxuan Wu, Xintong Han, Menglin Jia, and Yu-Gang Jiang. Promptfusion: Decoupling
+stability and plasticity for continual learning.arXiv preprint arXiv:2303.07223, 2023.
+Shoufa Chen, Chongjian Ge, Zhan Tong, Jiangliu Wang, Yibing Song, Jue Wang, and Ping Luo.
+Adaptformer: Adapting vision transformers for scalable visual recognition.Advances in Neural
+Information Processing Systems, 35:16664–16678, 2022.
+Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie Yan, Haichen Shen, Meghan
+Cowan, Leyuan Wang, Yuwei Hu, Luis Ceze, et al. Tvm: An automated end-to-end optimizing
+compiler for deep learning. In13th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 18), pp. 578–594, 2018.
+Stuart Coles, Joanna Bawa, Lesley Trenner, and Pat Dorazio.An introduction to statistical modeling
+of extreme values, volume 208. Springer, 2001.
+Sanjoy Dasgupta, Charles F. Stevens, and Saket Navlakha. A neural algorithm for a fundamental
+computing problem.Science, 358(6364):793–796, 2017. doi: 10.1126/science.aam9868.
+11
+Published as a conference paper at ICLR 2026
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, et al. An
+image is worth 16x16 words: Transformers for image recognition at scale.arXiv preprint
+arXiv:2010.11929, 2020.
+Ronald Aylmer Fisher and Leonard Henry Caleb Tippett. Limiting forms of the frequency distribution
+of the largest or smallest member of a sample. InMathematical proceedings of the Cambridge
+philosophical society, volume 24, pp. 180–190. Cambridge University Press, 1928.
+Qiankun Gao, Chen Zhao, Yifan Sun, Teng Xi, Gang Zhang, Bernard Ghanem, and Jian Zhang.
+A unified continual learning framework with general parameter-efficient tuning. InICCV, pp.
+11483–11493, October 2023.
+Gene H Golub, Michael Heath, and Grace Wahba. Generalized cross-validation as a method for
+choosing a good ridge parameter.Technometrics, 21(2):215–223, 1979.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+recognition. InProceedings of the IEEE conference on computer vision and pattern recognition,
+pp. 770–778, 2016.
+Donald Olding Hebb.The organization of behavior: A neuropsychological theory. Psychology press,
+2005.
+Dan Hendrycks, Steven Basart, Norman Mu, Saurav Kadavath, Frank Wang, Evan Dorundo, Rahul
+Desai, Tyler Zhu, Samyak Parajuli, Mike Guo, et al. The many faces of robustness: A critical
+analysis of out-of-distribution generalization. InProceedings of the IEEE/CVF international
+conference on computer vision, pp. 8340–8349, 2021a.
+Dan Hendrycks, Kevin Zhao, Steven Basart, Jacob Steinhardt, and Dawn Song. Natural adversarial
+examples. InProceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+pp. 15262–15271, 2021b.
+Toshihide Hige, Yoshinori Aso, Gerald M Rubin, and Glenn C Turner. Plasticity-driven individ-
+ualization of olfactory coding in mushroom body output neurons.Nature, 526(7572):258–262,
+2015.
+Arthur E Hoerl and Robert W Kennard. Ridge regression: Biased estimation for nonorthogonal
+problems.Technometrics, 12(1):55–67, 1970.
+Menglin Jia, Luming Tang, Bor-Chun Chen, Claire Cardie, Serge Belongie, Bharath Hariharan, and
+Ser-Nam Lim. Visual prompt tuning. InEuropean Conference on Computer Vision, pp. 709–727.
+Springer, 2022.
+William B Johnson, Joram Lindenstrauss, et al. Extensions of lipschitz mappings into a hilbert space.
+Contemporary mathematics, 26(189-206):1, 1984.
+Dahuin Jung, Dongyoon Han, Jihwan Bang, and Hwanjun Song. Generating instance-level prompts
+for rehearsal-free continual learning. InProceedings of the IEEE/CVF International Conference
+on Computer Vision, pp. 11847–11857, 2023.
+Pentti Kanerva.Sparse distributed memory. MIT press, 1988.
+James Kirkpatrick, Razvan Pascanu, Neil Rabinowitz, Joel Veness, Guillaume Desjardins, Andrei A
+Rusu, Kieran Milan, John Quan, Tiago Ramalho, Agnieszka Grabska-Barwinska, et al. Overcoming
+catastrophic forgetting in neural networks.Proceedings of the national academy of sciences, 114
+(13):3521–3526, 2017.
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+Zhizhong Li and Derek Hoiem. Learning without forgetting.IEEE transactions on pattern analysis
+and machine intelligence, 40(12):2935–2947, 2017.
+Dongze Lian, Daquan Zhou, Jiashi Feng, and Xinchao Wang. Scaling & shifting your features: A
+new baseline for efficient model tuning.Advances in Neural Information Processing Systems, 35:
+109–123, 2022.
+12
+Published as a conference paper at ICLR 2026
+Yan-Shuo Liang and Wu-Jun Li. Inflora: Interference-free low-rank adaptation for continual learning.
+InProceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pp.
+23638–23647, 2024.
+Yuchen Liang, Chaitanya K Ryali, Benjamin Hoover, Leopold Grinberg, Saket Navlakha, Mo-
+hammed J Zaki, and Dmitry Krotov. Can a fruit fly learn word embeddings?arXiv preprint
+arXiv:2101.06887, 2021.
+Andrew C Lin, Alexei M Bygrave, Alix De Calignon, Tzumin Lee, and Gero Miesenböck. Sparse,
+decorrelated odor coding in the mushroom body enhances learned odor discrimination.Nature
+neuroscience, 17(4):559–568, 2014.
+Ashok Litwin-Kumar, Kameron Decker Harris, Richard Axel, Haim Sompolinsky, and LF Abbott.
+Optimal degrees of synaptic connectivity.Neuron, 93(5):1153–1164, 2017.
+Yixiu Mao, Hongchang Zhang, Chen Chen, Yi Xu, and Xiangyang Ji. Supported trust region
+optimization for offline reinforcement learning. InInternational Conference on Machine Learning,
+pp. 23829–23851. PMLR, 2023a.
+Yixiu Mao, Hongchang Zhang, Chen Chen, Yi Xu, and Xiangyang Ji. Supported value regularization
+for offline reinforcement learning.Advances in Neural Information Processing Systems, 36:
+40587–40609, 2023b.
+Yixiu Mao, Qi Wang, Chen Chen, Yun Qu, and Xiangyang Ji. Offline reinforcement learning with
+ood state correction and ood action suppression.Advances in Neural Information Processing
+Systems, 37:93568–93601, 2024a.
+Yixiu Mao, Qi Wang, Yun Qu, Yuhang Jiang, and Xiangyang Ji. Doubly mild generalization for offline
+reinforcement learning.Advances in Neural Information Processing Systems, 37:51436–51473,
+2024b.
+Yixiu Mao, Yun Qu, Qi Wang, and Xiangyang Ji. Adaptive neighborhood-constrained q learning for
+offline reinforcement learning.arXiv preprint arXiv:2511.02567, 2025.
+Yixiu Mao, Yun Qu, Cheems Wang, Heming Zou, and Xiangyang Ji. Dynamics-predictive sampling
+for active RL finetuning of large reasoning models. InThe Fourteenth International Confer-
+ence on Learning Representations, 2026. URL https://openreview.net/forum?id=
+voeheZjd8p.
+Mark D McDonnell, Dong Gong, Amin Parveneh, Ehsan Abbasnejad, and Anton van den Hengel.
+Ranpac: Random projections and pre-trained models for continual learning.arXiv preprint
+arXiv:2307.02251, 2023.
+Ahmed Metwally, Divyakant Agrawal, and Amr El Abbadi. An integrated efficient solution for
+computing frequent and top-k elements in data streams.ACM Transactions on Database Systems
+(TODS), 31(3):1095–1133, 2006.
+Maria Papadopoulou, Stijn Cassenaer, Thomas Nowotny, and Gilles Laurent. Normalization for
+sparse encoding of odors by a wide-field interneuron.Science, 332(6030):721–725, 2011.
+Ameya Prabhu, Shiven Sinha, Ponnurangam Kumaraguru, Philip HS Torr, Ozan Sener, and Puneet K
+Dokania. Random representations outperform online continually learned representations.arXiv
+preprint arXiv:2402.08823, 2024.
+Yun Qu, Boyuan Wang, Jianzhun Shao, Yuhang Jiang, Chen Chen, Zhenbin Ye, Liu Linc, Yang Feng,
+Lin Lai, Hongyang Qin, et al. Hokoff: Real game dataset from honor of kings and its offline
+reinforcement learning benchmarks.Advances in Neural Information Processing Systems, 36:
+22166–22190, 2023.
+Yun Qu, Boyuan Wang, Yuhang Jiang, Jianzhun Shao, Yixiu Mao, Cheems Wang, Chang Liu,
+and Xiangyang Ji. Choices are more important than efforts: Llm enables efficient multi-agent
+exploration.arXiv preprint arXiv:2410.02511, 2024.
+13
+Published as a conference paper at ICLR 2026
+Yun Qu, Yuhang Jiang, Boyuan Wang, Yixiu Mao, Cheems Wang, Chang Liu, and Xiangyang
+Ji. Latent reward: Llm-empowered credit assignment in episodic reinforcement learning. In
+Proceedings of the AAAI Conference on Artificial Intelligence, volume 39, pp. 20095–20103,
+2025a.
+Yun Qu, Cheems Wang, Yixiu Mao, Yiqin Lv, and Xiangyang Ji. Fast and robust: Task sampling
+with posterior and diversity synergies for adaptive decision-makers in randomized environments.
+InForty-second International Conference on Machine Learning, 2025b.
+Yun Qu, Qi Wang, Yixiu Mao, Vincent Tao Hu, Björn Ommer, and Xiangyang Ji. Can prompt
+difficulty be online predicted for accelerating rl finetuning of reasoning models?arXiv preprint
+arXiv:2507.04632, 2025c.
+Parikshit Ram and Kaushik Sinha. Federated nearest neighbor classification with a colony of fruit-
+flies. InProceedings of the AAAI Conference on Artificial Intelligence, volume 36, pp. 8036–8044,
+2022.
+Jianzhun Shao, Yun Qu, Chen Chen, Hongchang Zhang, and Xiangyang Ji. Counterfactual conserva-
+tive q learning for offline multi-agent reinforcement learning.Advances in Neural Information
+Processing Systems, 36:77290–77312, 2023.
+Jaiyam Sharma and Saket Navlakha. Improving similarity search with high-dimensional locality-
+sensitive hashing.arXiv preprint arXiv:1812.01844, 2018.
+James Seale Smith, Leonid Karlinsky, Vyshnavi Gutta, Paola Cascante-Bonilla, Donghyun Kim, Assaf
+Arbelle, Rameswar Panda, Rogerio Feris, and Zsolt Kira. Coda-prompt: Continual decomposed
+attention-based prompting for rehearsal-free continual learning. InCVPR, pp. 11909–11919, 2023.
+Charles F Stevens. What the fly’s nose tells the fly’s brain.Proceedings of the National Academy of
+Sciences, 112(30):9460–9465, 2015.
+Hai-Long Sun, Da-Wei Zhou, Han-Jia Ye, and De-Chuan Zhan. Pilot: A pre-trained model-based
+continual learning toolbox.arXiv preprint arXiv:2309.07117, 2023.
+Hai-Long Sun, Da-Wei Zhou, Hanbin Zhao, Le Gan, De-Chuan Zhan, and Han-Jia Ye. Mos: Model
+surgery for pre-trained model-based class-incremental learning. InProceedings of the AAAI
+Conference on Artificial Intelligence, volume 39, pp. 20699–20707, 2025.
+Yu-Ming Tang, Yi-Xing Peng, and Wei-Shi Zheng. When prompt-based incremental learning does not
+meet strong pretraining. InProceedings of the IEEE/CVF International Conference on Computer
+Vision, pp. 1706–1716, 2023.
+Terence Tao and Van Vu. On random ±1 matrices: singularity and determinant.Random Struct.
+Algor., 28(1):1–23, 2006.
+Catherine Wah, Steve Branson, Peter Welinder, Pietro Perona, and Serge Belongie. The caltech-ucsd
+birds-200-2011 dataset. 2011.
+Boyuan Wang, Yun Qu, Yuhang Jiang, Jianzhun Shao, Chang Liu, Wenming Yang, and Xiangyang Ji.
+Llm-empowered state representation for reinforcement learning.arXiv preprint arXiv:2407.13237,
+2024a.
+Huiyi Wang, Haodong Lu, Lina Yao, and Dong Gong. Self-expansion of pre-trained models with
+mixture of adapters for continual learning. InProceedings of the Computer Vision and Pattern
+Recognition Conference, pp. 10087–10098, 2025a.
+Liyuan Wang, Jingyi Xie, Xingxing Zhang, Mingyi Huang, Hang Su, and Jun Zhu. Hierarchical
+decomposition of prompt-based continual learning: Rethinking obscured sub-optimality.arXiv
+preprint arXiv:2310.07234, 2023a.
+Qi Wang, Zehao Xiao, Yixiu Mao, Yun Qu, Jiayi Shen, Yiqin Lv, and Xiangyang Ji. Model predictive
+task sampling for efficient and robust adaptation.arXiv preprint arXiv:2501.11039, 2025b.
+14
+Published as a conference paper at ICLR 2026
+Yabin Wang, Zhiheng Ma, Zhiwu Huang, Yaowei Wang, Zhou Su, and Xiaopeng Hong. Isolation
+and impartial aggregation: A paradigm of incremental learning without interference. InAAAI,
+volume 37, pp. 10209–10217, 2023b.
+Zifeng Wang, Zizhao Zhang, Sayna Ebrahimi, Ruoxi Sun, Han Zhang, Chen-Yu Lee, Xiaoqi Ren,
+Guolong Su, Vincent Perot, Jennifer Dy, et al. Dualprompt: Complementary prompting for
+rehearsal-free continual learning.arXiv preprint arXiv:2204.04799, 2022a.
+Zifeng Wang, Zizhao Zhang, Chen-Yu Lee, Han Zhang, Ruoxi Sun, Xiaoqi Ren, Guolong Su, Vincent
+Perot, Jennifer Dy, and Tomas Pfister. Learning to prompt for continual learning. InCVPR, pp.
+139–149, 2022b.
+Ziqi Wang, Chang Che, Qi Wang, Yangyang Li, Zenglin Shi, and Meng Wang. Separable mixture of
+low-rank adaptation for continual visual instruction tuning.arXiv preprint arXiv:2411.13949, 1,
+2024b.
+Ziqi Wang, Chang Che, Qi Wang, Hui Ma, Zenglin Shi, Cees GM Snoek, and Meng Wang. Harmo-
+nious parameter adaptation in continual visual instruction tuning for safety-aligned mllms.arXiv
+preprint arXiv:2511.20158, 2025c.
+Zehao Xiao, Shilin Yan, Jack Hong, Jiayin Cai, Xiaolong Jiang, Yao Hu, Jiayi Shen, Qi Wang, and
+Cees GM Snoek. Dynaprompt: Dynamic test-time prompt tuning.arXiv preprint arXiv:2501.16404,
+2025.
+Jiazuo Yu, Yunzhi Zhuge, Lu Zhang, Ping Hu, Dong Wang, Huchuan Lu, and You He. Boosting
+continual learning of vision-language models via mixture-of-experts adapters. InProceedings of
+the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pp. 23219–23230, 2024.
+Yunliang Zang and Erik De Schutter. Recent data on the cerebellum require new models and theories.
+Current Opinion in Neurobiology, 2023.
+Friedemann Zenke, Ben Poole, and Surya Ganguli. Continual learning through synaptic intelligence.
+InInternational conference on machine learning, pp. 3987–3995. PMLR, 2017.
+Xiaohua Zhai, Joan Puigcerver, Alexander Kolesnikov, Pierre Ruyssen, Carlos Riquelme, Mario
+Lucic, Josip Djolonga, Andre Susano Pinto, Maxim Neumann, Alexey Dosovitskiy, et al. A
+large-scale study of representation learning with the visual task adaptation benchmark.arXiv
+preprint arXiv:1910.04867, 2019.
+Da-Wei Zhou, Han-Jia Ye, De-Chuan Zhan, and Ziwei Liu. Revisiting class-incremental learn-
+ing with pre-trained models: Generalizability and adaptivity are all you need.arXiv preprint
+arXiv:2303.07338, 2023a.
+Da-Wei Zhou, Yuanhan Zhang, Jingyi Ning, Han-Jia Ye, De-Chuan Zhan, and Ziwei Liu. Learning
+without forgetting for vision-language models.arXiv preprint arXiv:2305.19270, 2023b.
+Da-Wei Zhou, Hai-Long Sun, Han-Jia Ye, and De-Chuan Zhan. Expandable subspace ensemble for
+pre-trained model-based class-incremental learning. InCVPR, 2024.
+Huiping Zhuang, Yuchen Liu, Run He, Kai Tong, Ziqian Zeng, Cen Chen, Yi Wang, and Lap-Pui
+Chau. F-oal: Forward-only online analytic learning with fast training and low memory footprint in
+class incremental learning.Advances in Neural Information Processing Systems, 37:41517–41538,
+2024.
+Heming Zou, Yixiu Mao, Yun Qu, Qi Wang, and Xiangyang Ji. Utility-diversity aware online batch
+selection for llm supervised fine-tuning.arXiv preprint arXiv:2510.16882, 2025a.
+Heming Zou, Yunliang Zang, and Xiangyang Ji. Structural features of the fly olfactory circuit mitigate
+the stability-plasticity dilemma in continual learning.arXiv preprint arXiv:2502.01427, 2025b.
+Heming Zou, Yunliang Zang, Wutong Xu, Yao Zhu, and Xiangyang Ji. FlyloRA: Boosting task
+decoupling and parameter efficiency via implicit rank-wise mixture-of-experts. InThe Thirty-
+ninth Annual Conference on Neural Information Processing Systems, 2025c. URL https:
+//openreview.net/forum?id=nGQLYn13Xf.
+15
+Published as a conference paper at ICLR 2026
+A ALGORITHMPSEUDOCODE
+Algorithm 1Fly-CL Training Pipeline
+Input: Sequentially arriving data Dt ={(x t
+i, yt
+i )}nt
+i=1 where t= 1, . . . , T. Pre-trained encoder
+fθ. Projection operator Z(·) :R d →R m. Penalty coefficient candidates Λ ={λ 1, . . . , λl}.
+Zero-initialized matricesG 0 ∈R m×m andS 0 ∈R m×ct.
+Output:Modulated PrototypesC∈R m×ct.
+1:fort= 1, . . . , Tdo
+2:r= min(n t, m)
+3:Get compressed embedding for each datumv t
+i =f θ(xt
+i)∈R d
+4:Transform to high-dim sparse embeddingZ(v t
+i ) = top-k(W vt
+i )▷O(mn tp)
+5:ConcatenateZ(v t
+i )to getH t ∈R nt×m
+6:G t ←G t−1 +H ⊤
+t Ht ▷O(n tm2)
+7:S t ←S t−1 +H ⊤
+t Yt ▷O(n tctm)
+8:U t,Σ t,V t = svd(Ht)▷O(n trm)
+9:forλ∈Λdo
+10:D t = Σ2
+t
+Σ2
+t +λIr
+▷O(lr)
+11:df(λ) = tr(D t) = Pr
+i=1
+s2
+i
+s2
+i +λ ▷O(lr)
+12: ˆYt =U t(vecdiag(Dt)⊗1 ⊤
+c )⊙U ⊤
+t Yt ▷O(ln trct)
+13:GCV(λ) = ∥Yt− ˆYt(λ)∥2
+F
+nt(1− df(λ)
+nt )
+2 ▷O(ln tct)
+14:end for
+15:Selectλ ∗
+t = arg minλ∈Λ GCV(λ)
+16:L tL⊤
+t =G t +λ ∗
+t Im ▷O( 1
+3 m3)
+17:C t =L −⊤
+t (L−1
+t St)▷O(m 2ct)
+18:end for
+Algorithm 2Fly-CL Inference Pipeline
+Input: Sequentially arriving data Dt ={(x t
+i, yt
+i )}nt
+i=1 where t= 1, . . . , T. Pre-trained encoder fθ.
+Projection operatorZ. Modulated class prototypesC t ∈R m×ct.
+Output:Predicted labelsˆy.
+1:Get compressed embedding for each datumv=f θ(x)∈R d
+2:Transform to high-dim sparse embeddingZ(v) = top-k(W v)▷O(mp)
+3:Compute predictionˆy=Z(v) ⊤Ct ▷O(kc t)
+B COMPLETETHEORETICALANALYSIS
+In this section, we present a comprehensive theoretical analysis of the sparsification effects on both
+the weights and activations in the random projection operation.
+B.1 INFORMATIONPRESERVING FORSPARSECONNECTIONS INRANDOMPROJECTION
+MATRIX
+A common approach to demonstrate that sparse random matrix multiplication preserves information
+equivalently to its dense counterpart lies in proving the matrix’s near-preservation of full column rank.
+For our sparse random matrix W∈R m×d where m > d, we prove that W almost surely maintains
+rankd.
+Theorem B.1.Given the matrix W∈R m×d, where m > d, with each row having exactlyp non-zero
+entries, which are randomly sampled from N(0,1) . Let W ∈Rd×d be any square submatrix of W .
+Then, for anyϵ >0, it holds that
+P
+
+|det(W)| ≥
+ p
+d
+d/2 √
+d! exp(−d1/2+ϵ)
+
+= 1−o(1).
+16
+Published as a conference paper at ICLR 2026
+Thus, for sufficiently large p and d, any submatrix W is invertible with probability at least 1−o(1) .
+Proof. According to aformentioned definition, we have E(Wij) = 0 and Var(Wij) = p
+d. Consider-
+ing R= 1
+σ W, which satisfies E(Rij) = 0, Var(Rij) = 1, we can conclude, based on (Tao & Vu,
+2006, Theorem 8.9), that
+P
+
+|det(R)| ≥
+√
+d! exp(−d1/2+ϵ)
+
+= 1−o(1).(18)
+By usingσ=
+p p
+d anddet(R) =σ −d det(W)for substitution, we complete the proof.
+Figure 6: Empirical Verification of the Johnson-
+Lindenstrauss (JL) Property using Sparse Random
+Projection.
+To better demonstrate the information preserv-
+ing property of our construction, another line
+of validation is to utilize the random matrix’s
+distance preservation property, which is theoret-
+ically guaranteed by the Johnson-Lindenstrauss
+(JL) lemma (Johnson et al., 1984). Specifi-
+cally, we conduct an empirical simulation to
+verify that the normalization of our sparse pro-
+jection matrix Φ=
+q
+d
+mp W preserves pair-
+wise Euclidean distances between feature vec-
+tors with high probability. For every pair of vec-
+tors (x1,x 2), we calculate the Distortion Ratio
+defined as Ratio= ∥Φ(x1−x2)∥2
+2
+∥x1−x2∥2
+2
+. We randomly
+select 500 data points from the extracted fea-
+tures of CIFAR-100 dataset and compute the
+pairwise distances between all point pairs, with
+the results illustrated in Figure 6. By analyzing
+the distribution of these ratios across all vector
+pairs, the resulting histogram shows a strong
+concentration around the ideal value of 1. If we set ϵ to 0.03, then the vast majority of the ratios
+are empirically confined within the bounds of [1−ϵ,1 +ϵ] . This concentration strongly validates
+that our sparse projection structure-comprising only p non-zero N(0,1) entries per row-effectively
+maintains the geometric structure of the high-dimensional data.
+B.2 ROBUSTNESS OFTOP-kSPARSIFICATION ONHIGH-DIMENSIONALEMBEDDINGS
+Let the high-dimensional embedding vector be h∈R m. After applying the top- k operation, we
+obtain a sparsified vector h′ ∈R m, where only the k largest absolute values in h are retained, and
+the remaining elements are set to zero. We aim to prove that when k= Ω(m α) (with 0< α <1, i.e.,
+not overly sparse), the performance degradation is negligible.
+According to statistic learning theory (Bartlett & Mendelson, 2002) and extreme value theory (Coles
+et al., 2001; Fisher & Tippett, 1928), we start with the following two widely-accepted assumption:
+Assumption B.2.Assume that the “energy" (squared ℓ2-norm) of the embedding vector x is concen-
+trated in a few dimensions, i.e., there exists a constantC >0such that:
+E
+" Pk
+i=1 h2
+i
+∥h∥2
+2
+#
+≥1− C
+k ,
+where whereh i denotes thei-th largest value inh.
+Assumption B.3.Assume that the performance loss function L(h, y)of the downstream task (e.g.,
+classifier) is Lipschitz continuous with respect to input perturbations, i.e., there exists a constant
+M >0such that:
+|L(h, y)−L(h′, y)| ≤M· ∥h−h′∥.
+Regarding the approximation error of top-koperation, we show it is bounded.
+17
+Published as a conference paper at ICLR 2026
+Theorem B.4.Under the Assumption B.2, the sparsification error satisfies:
+E
+
+∥h−h ′∥2
+2
+
+≤ C
+k ·E
+
+∥h∥2
+2
+
+.
+Proof.By Assumption B.2:
+E
+" dX
+i=k+1
+h2
+i
+#
+≤ C
+k ·E
+
+∥h∥2
+2
+
+.
+Thus,
+E
+
+∥h−h ′∥2
+2
+
+=E
+" mX
+i=k+1
+h2
+i
+#
+≤ C
+k ·E
+
+∥h∥2
+2
+
+.
+Then, we can quantify the upper bound of possible performance degradation.
+Theorem B.5.Under Assumption B.3, the performance degradation due to sparsification satisfies:
+E[|L(h, y)−L(h ′, y)|]≤M·
+r
+C
+k ·E[∥h∥ 2
+2]
+Proof.By the Cauchy-Schwarz inequality and Theorem B.4, we can derive that
+E[|L(h, y)−L(h ′, y)|]≤M·E[∥h−h ′∥2]
+≤M·
+q
+E[∥h−h ′∥2
+2]
+≤M·
+r
+C
+k ·E[∥h∥ 2
+2].
+From Theorem B.5, we establish in Theorem B.6 that moderate sparsity does not result in significant
+performance degradation, as the error decreases exponentially with the increasing expanded dimension
+m.
+Theorem B.6.For top- k sparsification in the expanded dimension m, the performance degradation
+is bounded by:
+E[|L(h, y)−L(h ′, y)|]≤M·
+r
+C
+k ·E[∥h∥ 2
+2],
+where L(·) is a performance loss function for downstream tasks and C, M are constants. To ensure
+negligible performance degradation, we require:
+r
+C
+k ·E[∥h∥ 2
+2]≤ O
+ 1√
+mα
+
+,
+i.e., when k= Ω(m α) (0< α <1), the error bound decays exponentially with increasing dimension.
+For example:
+• Ifk= Ω(d 0.5), the performance degradation isO(d −0.25).
+• Ifk= Ω(d 0.8), the performance degradation isO(d −0.4).
+18
+Published as a conference paper at ICLR 2026
+C ADDITIONALRESULTS
+C.1 EXPERIMENTS INLONGERTASKSEQUENCES
+To evaluate the long-term stability of Fly-CL, we conduct experiments with task sequences twice as
+long as those in Table 1. Results are presented in Table 5 and Figure 7. Overall, both τtrain and τpost
+are shorter than those in Table 1 due to fewer samples per task. Fly-CL improves overall accuracy
+by 0.54%, 1.21%, and 1.58% compared to SOTA methods, while significantly reducing average
+post-extraction training time by 89%, 74%, and 59% compared to the most efficient baselines. These
+results are consistent with the trends observed in Table 1 and Figure 8, demonstrating the robustness
+of Fly-CL across different task lengths.
+Table 5:Performance Comparison on Pre-trained ViT-B/16 Models with Longer Task Sequence.
+We report the average training time per task (τtrain), average post-extraction training time (τpost), and
+overall accuracy ( ¯A) across three benchmark datasets: CIFAR-100, CUB-200-2011, and VTAB. The
+best results are highlighted inbold.
+Method CIFAR-100 CUB-200-2011 VTAB
+τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑)
+L2P 147.47±0.36107.59±0.2682.69±0.9130.93±0.2523.39±0.2672.83±1.4532.17±0.3929.31±0.3871.84±1.42
+Dualprompt130.12±0.0991.05±0.0783.42±0.8627.66±0.1820.28±0.1877.93±0.9129.44±0.2426.62±0.2378.46±1.14
+InfLoRA 124.80±0.3984.36±0.1288.18±0.3427.12±0.1419.85±0.0975.67±0.1629.71±0.2126.92±0.1781.09±0.73
+SEMA 128.95±0.4688.57±0.1988.93±0.5227.98±0.2520.52±0.1880.82±0.1130.36±0.2727.55±0.2084.56±0.48
+MoE-Adapter132.67±0.6292.31±0.4588.42±0.2830.25±0.1922.82±0.1578.62±0.3529.25±0.1826.81±0.1383.24±0.57
+EASE 350.92±0.39331.76±0.2990.14±0.5183.38±0.2275.05±0.1691.47±0.6564.68±0.7357.24±0.6290.26±0.41
+RanPAC 44.53±0.5837.03±0.5993.68±0.2420.68±0.3218.18±0.3192.65±0.2641.49±0.7440.02±0.5993.62±0.32
+F-OAL 16.32±0.028.91±0.0292.63±0.46 3.65±0.021.10±0.0191.48±0.232.17±0.160.71±0.0394.96±0.27
+Fly-CL 8.31±0.04 1.00±0.01 94.22±0.092.76±0.06 0.29±0.0193.86±0.271.70±0.10 0.29±0.0296.54±0.38
+5 15 25 35 45 55 65 75 85 95
+number of classes
+70
+80
+90
+100
+average accuracy (%)
+L2P
+DualPrompt
+EASE
+RanPAC
+F-OAL
+Fly-CL
+(a) CIFAR-100
+10 30 50 70 90 110 130 150 170 190
+number of classes
+50
+60
+70
+80
+90
+100
+average accuracy (%)
+L2P
+DualPrompt
+EASE
+RanPAC
+F-OAL
+Fly-CL (b) CUB-200-2011
+5 10 15 20 25 30 35 40 45 50
+number of classes
+50
+60
+70
+80
+90
+100
+average accuracy (%)
+L2P
+DualPrompt
+EASE
+RanPAC
+F-OAL
+Fly-CL (c) VTAB
+Figure 7:Accuracy Curves of Different Methods on Pre-trained ViT-B/16 with Longer Task
+Sequence.The average accuracy ( At) is reported for each dataset. These results align with and
+extend the quantitative analysis presented in Table 5.
+C.2 EXPERIMENTS ONDATASETS WITHSEVEREDOMAINSHIFT
+Table 6 summarizes the results on ImageNet-R and ImageNet-A under severe domain shift. Compared
+with existing continual learning baselines, Fly-CL achieves the best overall accuracy on both datasets
+(83.19% on ImageNet-R and 67.98% on ImageNet-A), comparable with the previous SOTA RanPAC.
+More importantly, Fly-CL attains these improvements with substantially lower computation cost.
+Its average training time per task is reduced by an order of magnitude compared to prompt-based
+methods (e.g., L2P, DualPrompt) and much faster than EASE, while its post-extraction training time
+is almost negligible (0.21s vs. 67.71s for RanPAC on ImageNet-R). These results demonstrate that
+Fly-CL is not only robust to severe distribution shifts but also highly efficient, making it especially
+suitable for practical continual learning scenarios where both accuracy and efficiency are critical.
+19
+Published as a conference paper at ICLR 2026
+Table 6:Performance Comparison on Pre-trained ViT-B/16 Models with Severe Domain Shift.
+We report the average training time per task (τtrain), average post-extraction training time (τpost), and
+overall accuracy ( ¯A) across two benchmark datasets: ImageNet-R and ImageNet-A. The best results
+are highlighted inbold.
+Method ImageNet-R ImageNet-A
+τtrain(↓)τ post(↓) ¯A(↑) τtrain(↓)τ post(↓) ¯A(↑)
+L2P 131.97±0.46110.56±0.4276.13±0.2156.28±0.3248.92±0.2748.86±0.08
+Dualprompt117.80±0.3496.58±0.3073.92±0.4649.60±0.2842.31±0.2657.05±0.13
+InfLoRA 62.32±0.3341.05±0.2382.15±0.4125.71±0.3018.50±0.2462.32±0.28
+SEMA 68.85±0.2147.34±0.1981.89±0.1728.65±0.2621.23±0.2261.79±0.32
+MoE-Adapter66.37±0.2945.02±0.2481.76±0.3326.27±0.4118.89±0.3761.72±0.21
+EASE 311.00±0.29274.36±0.2581.69±0.2480.80±0.1973.47±0.2265.03±0.28
+RanPAC 76.25±0.3567.71±0.2883.02±0.1232.43±0.1328.86±0.1167.28±0.09
+F-OAL 16.51±0.118.80±0.0480.62±0.25 3.99±0.071.05±0.0263.99±0.30
+Fly-CL 7.55±0.04 0.21±0.02 83.19±0.143.10±0.03 0.15±0.0167.98±0.17
+C.3 DATANORMALIZATIONSTRATEGY
+While data normalization is a well-established technique for improving classification performance
+in i.i.d. scenarios, its effectiveness in facilitating CL with frozen pre-trained encoders remains
+unclear. Our results indicate that applying proper architecture-specific normalization to input images
+significantly improves the learning performance compared to baseline CL methods (Table 7). The
+optimal normalization strategies for the included backbones differ. Across all tested datasets, ViT-
+B/16 (Dosovitskiy et al., 2020) benefits more from standard normalization that projects inputs into
+the [−1,1] range, while ResNet-50 (He et al., 2016) achieves optimal performance when normalized
+using ImageNet statistics.
+We hypothesize that the imporved performance arises from a reduced feature distribution shift across
+tasks. Proper normalization preserves the geometry of the pre-trained feature manifold, which is
+crucial for prototype-based classification, where cosine similarity measures depend on the angular
+relationships between features. Our empirical results suggest that input normalization may serve
+as a fundamental defense against forgetting by anchoring the feature space topology to the original
+pre-training distribution.
+Table 7:Comparison of CL Performance across Pre-trained Models and Normalization Strate-
+gies.We report overall accuracy ( ¯A). Normalization methods includes: “None” (no data normaliza-
+tion), “ImageNet” (ImageNet statistics), and “Standard”(scaled to the[−1,1]).
+Backbone CIFAR CUB VTAB
+None ImageNet Standard None ImageNet Standard None ImageNet Standard
+ViT-B/1691.64±0.6287.87±0.6293.89±0.1293.04±0.3790.68±0.4293.84±0.1895.26±0.6895.47±0.5296.54±0.38
+ResNet-5080.66±0.4884.61±0.1683.09±0.4875.08±1.2380.25±0.1076.78±1.0892.45±0.7194.00±0.1592.76±0.54
+C.4 MEMORYCONSUMPTION
+We also compare the memory consumption of Fly-CL against other methods in Table 8 using ViT-
+B/16 with the same task sequence as in Table 1. For fairness, we use a batch size of 128 across all
+methods and datasets. The results show Fly-CL also has the minimal memory cost, strengthening the
+efficiency of our method.
+C.5 MEMORY-TIME TRADEOFF IN HIGH-DIM PROJECTIONS
+We present the trade-off between memory, training time, and overall accuracy in Table 9. The
+overall accuracy gradually saturates as the dimension increases, while memory and training time
+grow quadratically. Therefore, we chose 10,000 as the dimension in our simulations. As long as the
+20
+Published as a conference paper at ICLR 2026
+Table 8:Memory Usage (GB) of Different Methods on Pre-trained ViT-B/16.We report highest
+peak memory usage of each methods. The best results are highlighted inbold.
+Method CIFAR-100 CUB-200-2011 VTAB
+L2P 16.4GB 16.4GB 16.4GB
+DualPrompt 13.6GB 13.6GB 13.6GB
+InfLoRA 14.1GB 14.1GB 14.1GB
+SEMA 12.9GB 12.9GB 12.9GB
+MoE-Adapter 20.2GB 20.2GB 20.2GB
+EASE 12.2GB 12.2GB 12.2GB
+RanPAC 12.2GB 12.2GB 22.8GB
+F-OAL 12.2GB 4.9GB 4.5GB
+Fly-CL 6.7GB 4.6GB 4.3GB
+dimension does not exceed 10,000, both memory and training time consumption remain lower than
+those of previous methods, as summarized in Table 1.
+Table 9:Memory-Time-Accuracy comparison with increasing projection dimension.It’s con-
+ducted on the CUB dataset using ViT B/16. We report highest peak memory usage of each methods.
+The best results are highlighted inbold.
+Dimension 1000 2000 5000 10000 20000
+Memory 2.8G 2.8G 3.0G 4.6G 9.3G
+τtrain 4.19±0.024.20±0.054.25±0.074.43±0.115.13±0.08
+¯A90.87±0.4991.97±0.5292.93±0.4193.84±0.1893.90±0.52
+C.6 ADDITIONALVISUALIZEDFIGURES ANDEVALUATIONMETRICDURING THETRAINING
+PROCESS
+Here, we present a more detailed breakdown of the training processes for ViT-B/16 and ResNet-50.
+Results from Tables 1 and 2 are visualized in Figures 8 and 9. We list the average accuracy of different
+methods at different stages across three datasets. We additionally report the last-stage accuracy ( AT )
+10 20 30 40 50 60 70 80 90 100
+number of classes
+80
+85
+90
+95
+100
+average accuracy (%)
+L2P
+DualPrompt
+EASE
+RanPAC
+F-OAL
+Fly-CL
+(a) CIFAR-100
+10 20 30 40 50 60 70 80 90 100
+number of classes
+60
+70
+80
+90
+100
+average accuracy (%)
+L2P
+DualPrompt
+EASE
+RanPAC
+F-OAL
+Fly-CL (b) CUB-200-2011
+10 20 30 40 50
+number of classes
+60
+70
+80
+90
+100
+average accuracy (%)
+L2P
+DualPrompt
+EASE
+RanPAC
+F-OAL
+Fly-CL (c) VTAB
+Figure 8:Accuracy Curves of Different Methods on Pre-trained ViT-B/16.The average accuracy
+(At) is reported for each dataset. These results align with and extend the quantitative analysis
+presented in Table 1.
+and the backward transfer score (a representative forgetting metric) of Table 1 in Table 10 to provide
+a more comprehensive evaluation.
+C.7 ADDITIONALSENSITIVITYANALYSISACROSSTASKCOMPLEXITY, NUMBER OF
+TASKS/CLASSES,ANDDIFFERENTPRETRAINEDBACKBONES
+We further conduct additional sensitivity analyses under three complementary settings: (i) ImageNet-
+A with 10 tasks and 20 classes per task using ViT-B/16 to examine the effect of task complexity
+21
+Published as a conference paper at ICLR 2026
+10 20 30 40 50 60 70 80 90 100
+number of classes
+50
+60
+70
+80
+90
+100
+average accuracy (%)
+RanPAC
+F-OAL
+Fly-CL
+(a) CIFAR-100
+20 40 60 80 100 120 140 160 180 200
+number of classes
+50
+60
+70
+80
+90
+100
+average accuracy (%)
+RanPAC
+F-OAL
+Fly-CL (b) CUB-200-2011
+10 20 30 40 50
+number of classes
+0
+20
+40
+60
+80
+100
+average accuracy (%)
+RanPAC
+F-OAL
+Fly-CL (c) VTAB
+Figure 9:Accuracy Curves of Different Methods on Pre-trained ResNet-50.The average accuracy
+(At) is reported for each dataset. These results align with and extend the quantitative analysis
+presented in Table 2.
+Table 10:Performance Comparison on Pre-trained ViT-B/16 Models.We report the last stage
+accuracy (AT ), and backward transfer (BW T) across three benchmark datasets: CIFAR-100, CUB-
+200-2011, and VTAB.
+Method CIFAR-100 CUB-200-2011 VTAB
+AT(↑)BW T(↑) AT(↑)BW T(↑) AT(↑)BW T(↑)
+L2P 83.55±1.53-6.23±0.4165.41±1.84-13.14±0.5779.12±2.18-8.04±0.78
+DualPrompt81.45±0.52-7.06±0.2067.90±1.89-12.12±0.5379.83±2.37-7.63±0.75
+InfLoRA 86.56±0.46-5.07±0.1669.45±0.56-11.53±0.2587.88±0.73-4.59±0.24
+SEMA 87.47±0.43-4.70±0.1373.66±0.36-9.94±0.1989.28±0.60-4.06±0.22
+MoE-Adapter86.88±0.32-4.97±0.1568.11±0.41-12.11±0.2388.06±0.48-4.51±0.19
+EASE 87.63±0.20-4.66±0.0685.10±0.19-5.68±0.0893.30±0.07-2.48±0.04
+RanPAC 90.83±0.41-3.47±0.1188.95±0.48-4.16±0.2289.97±0.71-3.79±0.26
+F-OAL 87.04±0.50-4.90±0.1485.61±0.50-5.43±0.2492.91±0.07-2.66±0.04
+Fly-CL 89.85±0.17-3.82±0.0989.97±0.18-3.80±0.0794.61±0.35-2.01±0.15
+(Figure 10); (ii) CUB-200-2011 with 20 tasks and 10 classes per task using ViT-B/16 to evaluate the
+impact of a larger number of tasks and classes (Figure 11); and (iii) CUB-200-2011 with 10 tasks
+and 20 classes per task using ResNet-50 to assess the influence of different backbone architectures
+(Figure 12). Across all settings, the observed trends remain consistent with those reported in Figure 5.
+(a) Expanded dimm
+ (b) Sparsity levelp
+ (c) Coding levelk
+Figure 10:Sensitivity Analysis for Expanded dim m, Weight Sparsity p, and Activation Sparsity
+k on ImageNet-A.We report average accuracy in last task ( AT ) and overall accuracy ( ¯A). The dots
+denote the default values we use across experiments.
+C.8 ADDITIONALEXPERIMENTS ONLARGERPRE-TRAINEDMODELS
+In our previous experiments, we primarily adopted ResNet-50 and ViT-B/16 as backbones for feature
+extraction. To further evaluate the scalability of Fly-CL on modern foundation models, we employ
+the vision encoder of Qwen2.5-VL-7B (Bai et al., 2025) to extract visual features. As shown in
+Table 11, increasing the scale of the pre-trained backbone consistently leads to improved performance.
+22
+Published as a conference paper at ICLR 2026
+(a) Expanded dimm
+ (b) Sparsity levelp
+ (c) Coding levelk
+Figure 11:Sensitivity Analysis for Expanded dim m, Weight Sparsity p, and Activation Sparsity
+k on CUB-200 with Longer Task Sequence.We report average accuracy in last task ( AT ) and
+overall accuracy ( ¯A). The dots denote the default values we use across experiments.
+(a) Expanded dimm
+ (b) Sparsity levelp
+ (c) Coding levelk
+Figure 12:Sensitivity Analysis for Expanded dim m, Weight Sparsity p, and Activation Sparsity
+k on CUB-200 with ResNet-50 as Backbone.We report average accuracy in last task ( AT ) and
+overall accuracy ( ¯A). The dots denote the default values we use across experiments.
+Furthermore, in Figure 13, we analyze the effect of expanding the projection dimension when using
+Qwen2.5-VL. The trend remains consistent with our earlier findings: performance improves steadily
+as the expanded dimension grows, but begins to saturate around10,000.
+Table 11:Performance Comparison on Different Scale Pre-
+trained Models.We report overall accuracy ( ¯A) across three
+benchmark datasets: CIFAR-100, CUB-200-2011, and VTAB.
+Model CIFAR-100 CUB-200-2011 VTAB
+ResNet-50 84.61±0.1680.25±0.1094.00±0.15
+ViT-B/16 93.89±0.1293.84±0.1896.54±0.38
+Qwen2.5-VL-7B 95.06±0.2394.68±0.2197.45±0.24
+ Figure 13:Sensitivity Analysis
+for Expanded dimmon CUB-
+200 with Qwen2.5-VL-7B as
+Backbone.
+D DETAILEDDISCUSSION OFRELATEDWORK
+D.1 COMPARISON WITHSEVERALREPRESENTATION-BASEDMETHODS
+We highlight the main advantages of our proposed Fly-CL over several related representation-based
+methods, including RanPAC (McDonnell et al., 2023), F-OAL (Zhuang et al., 2024), and RanDumb
+(Prabhu et al., 2024).
+23
+Published as a conference paper at ICLR 2026
+Comparison with RanPAC.RanPAC employs several Parameter-Efficient Transfer Learning (PETL)
+approach (Chen et al., 2022; Jia et al., 2022; Lian et al., 2022) to adapt the pre-trained model
+to the downstream domain in the first task, alongside a ridge classification with explicit cross-
+validation for all ridge candidates. Although effective, these two components make the entire pipeline
+computationally expensive (see Table 1, 2, and 5). In contrast, Fly-CL eliminates the need for PETL
+and significantly optimizes the ridge classification process. Additionally, we introduce a sparse
+projection layer with a top-k operation, replacing the dense projection with ReLU, and analyze the
+impact of data normalization techniques. The speedup for each components can be refered to Table 4.
+Comparison with F-OAL.F-OAL is originally designed for online CL and shares similarities with
+Fly-CL in feature extraction, random projection, and decorrelation. Although it can also be adapted to
+the CIL setting with batched data, it has several flaws under this circumstance. For instance, F-OAL
+lacks the top-k operation to filter noisy components after random projection, and its iterative analytic
+classifier may accumulate errors, leading to significant performance degradation on ResNet-50 (see
+Table 2). Moreover, while F-OAL is efficient on CUB-200-2011 and VTAB, its computational cost
+scales more rapidly with sample size compared to Fly-CL, making it less efficient on CIFAR-100
+(see Table 1, 2, and 5).
+Comparison with RanDumb.RanDumb shares a similar pipeline with F-OAL and is also designed
+for online CL. Like F-OAL, it does not utilize a top-k-like operation, and its fixed penalty coefficient
+λ may result in suboptimal performance. Crucially, RanDumb relies on StreamingLDA, which
+processes samples sequentially and cannot be parallelized for batch processing. This makes RanDumb
+significantly slower than all baselines evaluated in Table 1, 2, and 5.
+D.2 SUMMARY OFOTHERCOMPAREDBASELINES
+L2P(Wang et al., 2022b) utilizes a prompt pool P={P 1, P2,· · ·, PM } where M is the size of the
+pool, to store task-specific knowledge. Each prompt Pi is associated with a learnable key Ki for
+key-value selection. By optimizing the cosine distance γ(p(x), ki), where p(x) is the feature selected
+by the query function during the training process, L2P can select the most appropriate prompt to
+provide information that is specific to the task.
+DualPrompt(Wang et al., 2022a) extends the key-value selection and optimization methods of L2P
+by further encoding different types of information into a task-invariant prompt g and a task-specific
+prompt e. This is shown to be more effective in encoding the learned knowledge. It also decouples
+the higher-level prompt space by attaching prompts to different layers, which is crucial for the model
+to reduce forgetting and achieve effective knowledge sharing.
+EASE(Zhou et al., 2024) first initializes and trains an adapter for each incoming task to encode
+task-specific information. It then extracts features of the current task and synthesizes prototypes of
+former classes to mitigate the subspace gaps between adapters. Finally, EASE constructs the full
+classifier and reweights the logits for prediction.
+InfLoRA(Liang & Li, 2024) is a Interference-Free Low-Rank Adaptation method for continual
+learning. It injects a small set of parameters to constrain weight updates to a specific subspace.
+Critically, this subspace is designed to be orthogonal to the gradients of all past tasks while containing
+the gradient subspace of the new task, thereby eliminating interference and achieving an effective
+balance between model stability and plasticity.
+SEMA(Wang et al., 2025a) introduces a self-expansion mechanism by dynamically adding modular
+adapters only when significant distribution shifts are detected. Each adapter consists of a functional
+module and a representation descriptor, which acts as a novelty detector to determine whether existing
+adapters can handle the new task. SEMA further maintains an expandable mixture router to compose
+adapters through weighted combination, enabling flexible reuse of old modules while expanding
+only on demand. This design achieves a sub-linear parameter growth rate while improving the
+stability–plasticity balance across tasks.
+MoE-Adapter(Yu et al., 2024) enhances continual learning by injecting a mixture-of-experts adapter
+structure into transformer blocks. Each MoE-Adapter contains multiple expert adapters, and a learned
+routing network selects or mixes experts conditioned on the input. This architecture allows the model
+to capture diverse task-specific patterns while mitigating forgetting through expert specialization. By
+24
+Published as a conference paper at ICLR 2026
+leveraging the MoE structure, the method improves representational flexibility and achieves stronger
+adaptation capacity compared to using a single shared adapter.
+D.3 RELATIONSHIP WITHKANERVA’SSPARSEDISTRIBUTEDMEMORY
+Kanerva’s Sparse Distributed Memory (SDM) (Kanerva, 1988) is a classical high-dimensional
+computing framework in which memory addresses are distributed in a large binary space, and
+read/write operations are performed by activating only those locations within a neighborhood defined
+by Hamming similarity. To highlight its conceptual connection to Fly-CL, we rewrite the SDM
+forward computation using the same notation as Fly-CL:
+ˆy=C ⊤ 
+f(W v)
+
+,(19)
+where W is an address transformation matrix, C is a content transformation matrix, and f(·) denotes
+a binary activation function.
+Under this formulation, SDM and Fly-CL share two high-level principles: (i) expansion into a high-
+dimensional representational space, which promotes separability and reduces interference; and (ii)
+sparse activation, which suppresses noises and enhances discrimination through selective addressing.
+Despite these conceptual parallels, Fly-CL differs from SDM in several important ways. First, W in
+SDM is updated through iterative read/write operations, whereas Fly-CL employs a fixed, randomly
+initialized projection matrix motivated by the fly olfactory circuit. Second, SDM does not incorporate
+any decorrelation mechanism analogous to the Fly-CL ridge-based KC-to-MBON transformation.
+Third, SDM operates in a binary space: the activation function f(·) produces binary addresses and
+similarity is evaluated via Hamming distance, while Fly-CL performs real-valued projections and
+uses cosine similarity for downstream matching and classification.
+These distinctions illustrate that although Fly-CL and SDM share the broad philosophy of high-
+dimensional sparse representations, their architectural assumptions, objectives, and operating regimes
+differ substantially.
+E TRAININGDETAILS
+E.1 PRE-TRAINEDMODELS
+We use pre-trained ViT-B/16 and ResNet-50 models in our experiments. The ViT-B/16 checkpoint
+we used was first pretrained on ImageNet-21K and then fine-tuned on the ImageNet-1K dataset. All
+of which are loaded using the timm library. We list the dimensions of the extracted features and the
+download links for the checkpoints of each model in Table 12.
+Table 12:Information Related to the Pre-trained Models We Used in This Work.We list the
+dimensions of the extracted features and provide corresponding download links for these pre-trained
+models.
+Model feature dimension Link
+ViT-B/16 768Link
+ResNet-50 2048Link
+E.2 DATASETS
+We evaluate our method on three benchmark datasets for CL tasks. Detailed information about these
+datasets, including download links, is provided in Table 13. For the experiments summarized in Tables
+1, 2, and 3, we configure the number of training tasks as T= 10 for CIFAR-100 and CUB-200-2011,
+with 10 and 20 classes per task, respectively. For VTAB, we setT= 5 with 10 classes per task. In
+the longer task sequence experiments (Table 5), we double the task sequence length: for CIFAR-100
+and CUB-200-2011, we set T= 20 with 5 and 10 classes per task, respectively, while for VTAB, we
+set T= 10 with 5 classes per task. For experiments in Table 6, we set T= 10 with 20 classes per
+task.
+25
+Published as a conference paper at ICLR 2026
+Table 13:Details of CIFAR-100, CUB-200-2011, VTAB Datasets.We list the number of training,
+validation samples and classes for the following datasets, along with the download links.
+Dataset Training Samples Validation Samples Classes Download Link
+CIFAR-100 (Krizhevsky et al., 2009)50000 10000 100Link
+CUB-200-2011 (Wah et al., 2011)9430 2358 200Link
+VTAB (Zhai et al., 2019)1796 8619 50Link
+Imagenet-R Hendrycks et al. (2021a)24000 6000 200Link
+Imagenet-A Hendrycks et al. (2021b)5981 1519 200Link
+E.3 EXPERIMENTSETUP
+We reproduce the baseline results for L2P, DualPrompt, EASE, and RanPAC using the code provided
+by PILOT (Sun et al., 2023), ensuring that the learning parameters for each baseline align with
+the description in their original papers. For F-OAL, we adopt their official implementation for
+reproduction.
+In our proposed Fly-CL, we set the expanded dimensionm to 10,000 , p to 300, and k to 3,000 across
+all experiments. For ViT-B/16, we apply standard data normalization, scaling each pixel value to the
+range [−1,1] . For ResNet-50, we normalize the input images using ImageNet statistics. Given the
+prior knowledge of high multicollinearity in this task, we explore the penalty coefficient range starting
+from larger values, specifically from106 to 109 on a log scale for ViT-B/16 and104 to 109 for ResNet-
+50. Since prompt-based methods and PETL techniques are limited to transformer-based architectures,
+we compare Fly-CL only with RanPAC and F-OAL in the ResNet-50 setting. For RanPAC, we remove
+PETL and incorporate data normalization following their original implementation (McDonnell et al.,
+2023) for ResNet-50. All experiments are conducted using five different random seeds, and we report
+the mean±standard deviation.
+E.4 ENVIRONMENTS
+All experiments were conducted on a Linux server running Ubuntu 20.04.4 LTS, equipped with an
+Intel(R) Xeon(R) Platinum 8358P CPU at 2.60GHz and 8 NVIDIA GeForce RTX 3090 GPUs, using
+CUDA version 11.7. For model loading, we employed the timm library (version 0.9.16).
+F LIMITATIONS ANDFUTUREWORK
+Our proposed Fly-CL is theoretically applicable to various scenarios requiring feature separation. Its
+lightweight design further suggests potential utility in a wide range of Continual Learning and Metric
+Learning tasks. Looking forward, the framework can be broadened in several promising directions.
+First, incorporating large language model (LLM) priors (Qu et al., 2025a; Wang et al., 2024a; Qu et al.,
+2024) could enrich the initial state representations, providing more structured semantic knowledge
+to guide the decorrelation process. Second, our streaming feature separation mechanism naturally
+extends to deep reinforcement learning (RL) and RL post-training. By stabilizing representations, it
+can help mitigate out-of-distribution (OOD) shifts and improve generalization in offline RL (Mao
+et al., 2024a;b; 2023a;b; 2025; Shao et al., 2023; Qu et al., 2023), as well as accelerate the online RL
+fine-tuning of reasoning models (Qu et al., 2025c; Mao et al., 2026). Finally, combining Fly-CL with
+intelligent data sampling strategies (Wang et al., 2025b; Qu et al., 2025b; Zou et al., 2025a) could
+synergistically enhance training efficiency and adaptation robustness in complex, non-stationary
+environments.
+Recent neuroscience research (Dasgupta et al., 2017) indicates that the random projection layer in the
+fly olfactory circuit may not be entirely random. Biological experiments also suggest the presence of
+certain constraints within this projection layer. Inspired by these findings, a promising direction for
+future research is to explore structuring the projection layer as an entity with learnable parameters,
+potentially enhancing its adaptability and performance.
+26
+Published as a conference paper at ICLR 2026
+G BROADERIMPACT
+Our work provides a new perspective for enhancing the efficiency of CL using pre-trained models,
+which is crucial for real-world deployment, especially with increasingly large modern models. Fly-CL
+can help AI researchers and developers create more efficient CL algorithms.
+On the other hand, the efficiency improvements in CL could potentially accelerate the development
+of AI systems that rapidly adapt to new domains without proper safeguards. This might lead to: (1)
+amplified propagation of biases present in sequential datasets, (2) reduced transparency as models
+continuously evolve beyond their initial training, and (3) potential misuse for generating tailored
+content at scale. We recommend implementing rigorous monitoring frameworks to track model
+behavior across learning phases.
+H LLM USAGEDECLARATION
+During the preparation of this manuscript, a large language model was employed exclusively for
+language refinement. Its role was limited to rephrasing certain passages and enhancing the overall
+clarity and readability of the text. All conceptual contributions, theoretical derivations, experimental
+design, and analysis were independently developed and verified by the authors. The LLM was not
+involved in generating research ideas, shaping methodologies, or producing novel scientific content.
+The authors bear full responsibility for the entirety of the paper.
+27

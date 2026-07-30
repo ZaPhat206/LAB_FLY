@@ -1,73 +1,70 @@
+"""
+main.py — RAPID v3: Block-wise Absolute WTA + Prototype Classifier (NCM)
+==========================================================================
+Cải tiến so với phiên bản cũ:
+  [YC1] Block-wise WTA với Absolute Top-k (Paper Eq.4 / Theorem 4.2)
+  [YC2] Prototype Classifier (NCM + Cosine Similarity) thay Ridge Regression
+  [YC3] Data normalization [-1,1] cho ViT-B/16 (Paper Appendix C.3)
+        → Truyền --data_augmentation vit khi chạy (default đã set).
+"""
 import argparse
 import time
 
 import torch
-import timm
 import numpy as np
-import torch.nn as nn
 from torch.nn import functional as F
-from tqdm import tqdm
 
 from datasets.load_dataset import load_dataset
 from models.load_model import load_model
-from utils import random_initialization, feature_extract, target2onehot
+from utils import random_initialization, feature_extract
 
 
+# =============================================================================
+# Argument Parser
+# =============================================================================
 def get_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Input hyperparameters for the experiment.")
-
-    # Continual Learning Task Setting
-    parser.add_argument('--dataset', default='CIFAR-100', help='Choose dataset')
-    parser.add_argument('--root', default='../data', help='Dataset path')
+    parser = argparse.ArgumentParser(
+        description="RAPID v3: Block-wise Absolute WTA + Prototype Classifier"
+    )
+    # CIL task setting
+    parser.add_argument('--dataset',     default='CIFAR-100', help='Choose dataset')
+    parser.add_argument('--root',        default='../data',   help='Dataset root path')
     parser.add_argument('--num_classes', type=int, default=100, help='Total number of classes')
-    parser.add_argument('--num_tasks', type=int, default=10, help='Number of tasks')
+    parser.add_argument('--num_tasks',   type=int, default=10,  help='Number of tasks')
 
-    # model Architecture
-    parser.add_argument('--model_name', type=str, default="vit_base_patch16_224", help='model name')
-    parser.add_argument('--embedding_dim', type=int, default=768, help='Embedding dimension of pre-trained model')
-    parser.add_argument('--expand_dim', type=int, default=10000, help='Expansion dimension of FlyModel')
-    parser.add_argument('--synaptic_degree', type=int, default=100, help='Number of connections')
-    parser.add_argument('--coding_level', type=float, default=0.01, help='Top-k number')
+    # Model / Projection
+    parser.add_argument('--model_name',      default="vit_base_patch16_224",
+                        help='Backbone model name')
+    parser.add_argument('--embedding_dim',   type=int, default=768,
+                        help='Backbone output dimension')
+    parser.add_argument('--expand_dim',      type=int, default=10000,
+                        help='Total neuron budget (split across tasks)')
+    parser.add_argument('--synaptic_degree', type=int, default=100,
+                        help='Non-zero connections per row p')
+    # [YC1] coding_level áp dụng PER BLOCK: k = coding_level × block_size
+    parser.add_argument('--coding_level',    type=float, default=0.3,
+                        help='Top-k ratio per block (paper default=0.3)')
 
-    # Training Configuration
-    parser.add_argument('--seed', type=int, default=2025, help='Random seed')
-    parser.add_argument('--ridge_lower', type=float, default=4, help='lower bound for ridge coefficient (log10)')
-    parser.add_argument('--ridge_upper', type=float, default=10, help='lower bound for ridge coefficient (log10)')
-    parser.add_argument('--data_augmentation', default=None, help='choose which normalization or not')
+    # Fisher-adaptive allocation
+    parser.add_argument('--fisher_block', type=int,   default=512,
+                        help='Step size for Fisher probe (neurons per step)')
+    parser.add_argument('--fisher_sat',   type=float, default=0.005,
+                        help='Fisher saturation threshold δ')
+
+    # [YC3] Normalization — "vit" → [-1,1] theo Paper Appendix C.3
+    parser.add_argument('--data_augmentation', default='vit',
+                        choices=[None, 'resnet', 'vit'],
+                        help='"vit"→Normalize([0.5],[0.5])=[-1,1]; '
+                             '"resnet"→ImageNet; None→raw [0,1]')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    parser.add_argument('--gpu', type=int, default=0, help='Choose gpu')
-    
+    parser.add_argument('--seed',       type=int, default=2025, help='Random seed')
+    parser.add_argument('--gpu',        type=int, default=0,    help='GPU index')
     return parser
 
 
-def select_ridge_parameter(Features, Y, ridge_lower, ridge_upper, G_dual_precomputed=None):
-    """
-    Chọn lambda tối ưu bằng GCV.
-    Dùng eigh(X @ X^T) thay vì SVD(X) để tránh OOM khi D >> N.
-    G_dual_precomputed: nếu đã tính sẵn X @ X^T, truyền vào để khỏi tính lại.
-    """
-    X = Features                  # (N, D)
-    N = X.shape[0]
-    G_dual = G_dual_precomputed if G_dual_precomputed is not None else X @ X.T
-    S_sq, U = torch.linalg.eigh(G_dual)
-    S_sq = S_sq.flip(0).clamp(min=0)
-    U    = U.flip(1)
-    UTY  = U.T @ Y                # (N, K)
-
-    ridges = torch.tensor(10.0 ** np.arange(ridge_lower, ridge_upper), device=X.device)
-    gcv_scores = []
-    for ridge in ridges:
-        diag      = S_sq / (S_sq + ridge)
-        df        = diag.sum()
-        Y_hat     = U @ (diag[:, None] * UTY)
-        residual  = torch.norm(Y - Y_hat) ** 2
-        gcv       = (residual / N) / (1 - df / N) ** 2
-        gcv_scores.append(gcv.item())
-
-    optimal_idx = np.argmin(gcv_scores)
-    return ridges[optimal_idx]
-
-
+# =============================================================================
+# Sparse Random Projection Block
+# =============================================================================
 def _make_sparse_projection_block(
     num_neurons: int,
     embedding_dim: int,
@@ -75,176 +72,234 @@ def _make_sparse_projection_block(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Tạo một block ma trận chiếu thưa (sparse random projection block).
+    Tạo sparse random projection block (num_neurons × embedding_dim).
+    Mỗi hàng có đúng non_zero_per_row kết nối != 0, lấy từ N(0,1).
+    """
+    W = torch.zeros(num_neurons, embedding_dim)
+    for row in range(num_neurons):
+        cols = torch.randperm(embedding_dim)[:non_zero_per_row]
+        W[row, cols] = torch.randn(non_zero_per_row)
+    return W.to(device)
 
-    Mỗi hàng (neuron) kết nối ngẫu nhiên với `non_zero_per_row` chiều đầu vào.
-    Block này sẽ được nối hàng (row-wise) vào ma trận chiếu hiện tại khi có task mới.
 
-    Args:
-        num_neurons     : Số neuron mới (số hàng của block, tức m).
-        embedding_dim   : Số chiều đầu vào d_in (số cột, cố định).
-        non_zero_per_row: Số kết nối không-zero mỗi hàng (synaptic_degree).
-        device          : torch device.
+# =============================================================================
+# Fisher Score — phát hiện saturation để dừng grow neuron
+# =============================================================================
+def compute_mean_fisher_score(
+    H: torch.Tensor,        # (N, m) projected features
+    labels: torch.Tensor,   # (N,) integer labels
+) -> float:
+    """
+    Fisher Score trung bình = E_neuron[ S_B / (S_B + S_W) ] ∈ [0,1].
+    Đo khả năng phân tách class trong không gian chiếu hiện tại.
+    """
+    N, D = H.shape
+    overall_mean = H.mean(dim=0)
+    S_B = torch.zeros(D, device=H.device)
+    S_W = torch.zeros(D, device=H.device)
+    for c in labels.unique():
+        mask = (labels == c)
+        H_c  = H[mask]
+        mu_c = H_c.mean(dim=0)
+        S_B += mask.sum() * (mu_c - overall_mean).pow(2)
+        S_W += (H_c - mu_c).pow(2).sum(dim=0)
+    return (S_B / (S_B + S_W + 1e-12)).mean().item()
+
+
+def adaptive_projection_size(
+    train_embs:  torch.Tensor,
+    train_labels: torch.Tensor,
+    embedding_dim: int,
+    synaptic_degree: int,
+    max_neurons: int,
+    block_size: int   = 512,
+    saturation_threshold: float = 0.005,
+    device: torch.device = torch.device('cpu'),
+) -> torch.Tensor:
+    """
+    Tự động xác định số neuron cần thiết bằng Fisher saturation.
+
+    Bắt đầu với block_size neuron; cứ thêm block_size và đo Δ Fisher Score.
+    Dừng khi Δ < saturation_threshold hoặc đạt max_neurons.
 
     Returns:
-        block : Tensor dense shape (num_neurons, embedding_dim) — trả về dense,
-                gọi .to_sparse_csc() bên ngoài khi cần.
+        dense Tensor (adaptive_m, embedding_dim)
     """
-    block = torch.zeros(num_neurons, embedding_dim)
-    for row in range(num_neurons):
-        selected_cols = torch.randperm(embedding_dim)[:non_zero_per_row]
-        block[row, selected_cols] = torch.randn(non_zero_per_row)
-    return block.to(device)
+    proj       = _make_sparse_projection_block(block_size, embedding_dim, synaptic_degree, device)
+    H          = train_embs @ proj.T
+    prev_score = compute_mean_fisher_score(H, train_labels.to(device))
+    print(f"    [Fisher] neurons={proj.shape[0]:5d}  score={prev_score:.4f}")
+
+    while proj.shape[0] < max_neurons:
+        remaining = max_neurons - proj.shape[0]
+        add_n     = min(block_size, remaining)
+        new_blk   = _make_sparse_projection_block(add_n, embedding_dim, synaptic_degree, device)
+        proj      = torch.cat([proj, new_blk], dim=0)
+        del new_blk
+
+        H_new = train_embs @ proj.T
+        score = compute_mean_fisher_score(H_new, train_labels.to(device))
+        delta = score - prev_score
+        print(f"    [Fisher] neurons={proj.shape[0]:5d}  score={score:.4f}  Δ={delta:+.4f}")
+        del H_new
+
+        if prev_score > 0 and delta < saturation_threshold:
+            print(f"    [Fisher] Saturation → stop at {proj.shape[0]} neurons.")
+            break
+        prev_score = score
+
+    return proj
 
 
 # =============================================================================
-# TODO: RAPID - [Single Unified Cosine Classifier]
-# Thay thế hệ thống per-task head bằng một classifier toàn cục duy nhất.
-# Thiết kế:
-#   - W: ma trận trọng số (expand_dim x num_seen_classes), được grow khi có class mới.
-#   - class_centroids: danh sách tensor prototype cho mỗi class đã học.
-#   - fit(): cập nhật cột của W bằng nghiệm Ridge cho các class của task hiện tại.
-#   - expand(): nối thêm các cột zero vào W để chứa class mới.
-#   - predict(): L2-normalize z và W rồi tính cosine similarity → argmax.
+# [YC1] Block-wise WTA với Absolute Top-k  (Paper Eq.4 / Theorem 4.2)
 # =============================================================================
-class UnifiedCosineClassifier:
+def blockwise_wta(
+    H_full: torch.Tensor,      # (D_total, N) — projected features
+    block_sizes: list[int],    # [m_0, m_1, ...] kích thước từng block theo task
+    coding_level: float,       # k/block_size — áp dụng riêng cho mỗi block
+) -> torch.Tensor:
     """
-    Single Unified Cosine Classifier cho Continual Learning.
+    [YC1] WTA độc lập trong từng block dùng Absolute Top-k.
 
-    Không yêu cầu task_id khi inference — predict() trả về global class index
-    trực tiếp dựa trên cosine similarity giữa feature vector và tất cả class
-    prototypes đã học.
+    Lý do dùng |x|.topk thay vì x.topk(largest=True):
+      • Paper Eq.4: h'_i = x_i nếu |x_i| thuộc top-k, ngược lại = 0.
+      • WTA toàn cục với largest=True bỏ qua activation âm lớn (ức chế),
+        làm mất thông tin và gây thiên lệch về kích hoạt dương.
+      • WTA per-block bảo vệ neuron task cũ khỏi bị "chết đói".
+      • Theorem 4.2: tổng k ∝ m → sai số hội tụ về 0.
+
+    Returns:
+        H_wta : (D_total, N) — sparse feature với per-block absolute WTA.
+    """
+    parts  = []
+    offset = 0
+    for bs in block_sizes:
+        blk = H_full[offset: offset + bs, :]          # (bs, N)
+        k   = max(1, int(bs * coding_level))
+
+        # [YC1 CORE] Top-k theo độ lớn |x| (không phải largest positive)
+        _, topk_idx = torch.abs(blk).topk(k, dim=0)   # (k, N) — index
+        # Lấy giá trị thực (giữ nguyên dấu âm/dương) tại các index đó
+        topk_vals   = torch.gather(blk, dim=0, index=topk_idx)  # (k, N)
+
+        blk_sparse  = torch.zeros_like(blk)
+        blk_sparse.scatter_(0, topk_idx, topk_vals)   # (bs, N)
+        parts.append(blk_sparse)
+        offset += bs
+
+    return torch.cat(parts, dim=0)                    # (D_total, N)
+
+
+# =============================================================================
+# [YC2] Prototype Classifier — NCM + Cosine Similarity
+#        Thay thế toàn bộ Ridge Regression + UnifiedCosineClassifier
+# =============================================================================
+class PrototypeClassifier:
+    """
+    [YC2] Nearest-Class-Mean Classifier với Cosine Similarity.
+
+    Lưu prototype μ_c = mean(h | y=c) cho mỗi class c đã thấy.
+    Khi thêm block mới (D tăng), zero-pad prototype cũ để nhất quán chiều.
+    Predict: ŷ = argmax_c cosine(h, μ_c).
+
+    Ưu điểm so với Ridge trong kiến trúc grow:
+      • Không có direction bias khi zero-pad (cosine normalize 2 vế).
+      • Không cần hyperparameter λ — không cần GCV.
+      • Training O(N·D), không O(N²·D).
+      • Block-wise WTA đã làm các block trực giao → NCM đủ mạnh.
     """
 
-    def __init__(self, init_dim: int, num_total_classes: int, device: torch.device):
-        """
-        Args:
-            init_dim         : Số chiều ban đầu của không gian fly-projection (k).
-                               Sẽ tăng dần sau mỗi task qua grow_projection().
-            num_total_classes: Tổng số class tối đa (dùng để pre-allocate cột W).
-            device           : torch device.
-        """
-        self.num_total_classes = num_total_classes
+    def __init__(self, device: torch.device):
         self.device = device
-        # fitted_class_indices: danh sách global class idx đã được fit (thứ tự thêm vào)
-        self.fitted_class_indices: list[int] = []
+        # global_class_idx → prototype tensor (D,)
+        self.prototypes: dict[int, torch.Tensor] = {}
+        self._current_dim: int = 0
 
-        self._current_dim: int = init_dim
-
-        # W[:, global_class_idx] chứa trọng số của class đó sau khi fit()
-        self.W = torch.zeros(init_dim, num_total_classes, device=device)  # (k, C_total)
-
-    # ------------------------------------------------------------------
-    # Property: chiều hiện tại của feature space
-    # ------------------------------------------------------------------
     @property
     def current_dim(self) -> int:
-        """Số chiều hiện tại của không gian chiếu (số hàng của W)."""
         return self._current_dim
 
-    # ------------------------------------------------------------------
-    # grow_projection: mở rộng W theo chiều hàng + zero-pad class cũ
-    # ------------------------------------------------------------------
-    def grow_projection(self, num_new_neurons: int) -> None:
+    def grow(self, num_new_neurons: int) -> None:
         """
-        Mở rộng ma trận W khi không gian chiếu được mở rộng thêm m neuron mới.
-
-        Logic zero-padding:
-          - Các cột class cũ ([:num_seen_classes]): pad thêm `num_new_neurons` hàng 0
-            vì các class cũ không được huấn luyện trên chiều mới → trọng số = 0.
-          - Các cột class mới (sẽ được điền bởi fit()): tự nhiên có toàn bộ
-            (current_dim + num_new_neurons) hàng ngay từ đầu.
-
-        Args:
-            num_new_neurons : Số neuron mới thêm vào (m), kích thước block mới.
+        [YC2 - Zero-Padding] Khi projection mở rộng thêm num_new_neurons chiều,
+        zero-pad cuối mỗi prototype cũ để giữ nhất quán số chiều D.
         """
-        # Zero-pad W cũ: nối thêm num_new_neurons hàng 0 cho tất cả cột
-        # Shape: (current_dim, C_total) → (current_dim + m, C_total)
-        padding = torch.zeros(num_new_neurons, self.num_total_classes, device=self.device)
-        self.W = torch.cat([self.W, padding], dim=0)  # (D_new, C_total)
+        pad = torch.zeros(num_new_neurons, device=self.device)
+        for cls_idx in self.prototypes:
+            self.prototypes[cls_idx] = torch.cat(
+                [self.prototypes[cls_idx], pad], dim=0
+            )
         self._current_dim += num_new_neurons
-        # Kết quả:
-        # - Cột class cũ (đã được fit): hàng [D_old:D_new] = 0  ← zero-padded
-        # - Cột class mới (chưa fit):   toàn 0, sẽ được fit() ghi vào sau
 
-    # ------------------------------------------------------------------
-    # expand: no-op, kept for API compatibility
-    # ------------------------------------------------------------------
-    def expand(self, num_new_classes: int) -> None:
-        """No-op: class tracking done automatically inside fit()."""
-        pass
-
-    # ------------------------------------------------------------------
-    # Fit: ghi nghiệm Ridge vào đúng cột W theo global class index
-    # ------------------------------------------------------------------
-    def fit(
+    def update(
         self,
-        Wo_task: torch.Tensor,          # (D, K) — nghiệm Ridge
-        task_class_indices: list[int],  # global class indices (KHÔNG cần sequential)
-        train_embeddings=None,          # unused, kept for compat
-        train_labels=None,              # unused, kept for compat
+        H: torch.Tensor,            # (N, D) dense — sau block-wise WTA
+        labels: torch.Tensor,       # (N,) global class labels
+        actual_classes: list[int],  # global class idx của task hiện tại
     ) -> None:
         """
-        Ghi W[:, global_idx] = Wo_task[:, local_idx] cho từng class.
-        Không giả định classes là sequential — dùng đúng global index.
+        Tính μ_c = mean(H[y==c]) và lưu vào prototypes[c].
+        Mỗi class chỉ xuất hiện trong 1 task → không cần cộng dồn.
         """
-        for local_idx, global_idx in enumerate(task_class_indices):
-            self.W[:, global_idx] = Wo_task[:, local_idx]
-        for g in task_class_indices:
-            if g not in self.fitted_class_indices:
-                self.fitted_class_indices.append(g)
+        H_dev = H.to(self.device)
+        lbl   = labels.to(self.device)
+        for cls in actual_classes:
+            mask = (lbl == cls)
+            if mask.sum() == 0:
+                continue
+            self.prototypes[cls] = H_dev[mask].mean(dim=0).detach()
+        if self._current_dim == 0:
+            self._current_dim = H.shape[1]
 
-    # ------------------------------------------------------------------
-    # Predict: Cosine Classifier — không cần task_id, trả về GLOBAL class idx
-    # ------------------------------------------------------------------
     def predict(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Dự đoán global class label bằng Cosine Similarity.
-        Chỉ so sánh với các class đã được fit (fitted_class_indices).
-        Trả về global class index (CPU tensor).
+        [YC2] ŷ = argmax_c cosine(h, μ_c).
+
+        Args:
+            z : (N, D) hoặc (D, N).
+        Returns:
+            global class indices (N,) on CPU.
         """
-        # Xử lý shape: (D, N) → (N, D)
-        # Dùng .shape[1] vì không thể biết chiều nào là D khi D==N
-        if z.dim() == 2 and z.shape[0] == self._current_dim:
-            z = z.T  # (D, N) -> (N, D)
+        if z.dim() == 2 and z.shape[1] != self._current_dim:
+            z = z.T   # (D, N) → (N, D)
 
-        z_norm = F.normalize(z.float(), p=2, dim=1)  # (N, D)
+        sorted_cls = sorted(self.prototypes.keys())
+        P          = torch.stack(
+            [self.prototypes[c] for c in sorted_cls], dim=0
+        ).float()                                      # (C, D)
 
-        # Lấy đúng cột của các class đã fit (KHÔNG dùng :num_seen_classes)
-        fitted  = sorted(self.fitted_class_indices)
-        W_active = self.W[:, fitted]                           # (D, num_fitted)
-        W_norm   = F.normalize(W_active.float(), p=2, dim=0)  # (D, num_fitted)
+        z_norm = F.normalize(z.float(), p=2, dim=1)   # (N, D)
+        P_norm = F.normalize(P,         p=2, dim=1)   # (C, D)
+        sim    = z_norm @ P_norm.T                     # (N, C)
 
-        cosine_logits = z_norm @ W_norm                        # (N, num_fitted)
-        local_preds   = cosine_logits.argmax(dim=1)            # (N,) — index vào fitted
+        local_preds = sim.argmax(dim=1)
+        cls_t       = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
+        return cls_t[local_preds].cpu()
 
-        # Ánh xạ local index → global class index
-        fitted_t = torch.tensor(fitted, dtype=torch.long, device=self.device)
-        global_preds = fitted_t[local_preds].cpu()  # (N,) global idx, trên CPU
-        return global_preds
-
-    # ------------------------------------------------------------------
-    # Evaluate: wrapper trả về accuracy (%)
-    # ------------------------------------------------------------------
-    def evaluate(
-        self,
-        test_embeddings: torch.Tensor,  # (D, N)
-        test_labels: torch.Tensor,      # (N,) global labels
-    ) -> float:
-        if test_embeddings.is_sparse:
-            test_embeddings = test_embeddings.to_dense()
-        predicts = self.predict(test_embeddings)  # (N,) global idx, CPU
-        return (predicts == test_labels.cpu()).float().mean().item() * 100.0
+    def evaluate(self, H: torch.Tensor, labels: torch.Tensor) -> float:
+        """Wrapper: trả về accuracy (%)."""
+        if H.is_sparse:
+            H = H.to_dense()
+        preds = self.predict(H)
+        return (preds == labels.cpu()).float().mean().item() * 100.0
 
 
+# =============================================================================
+# MAIN
+# =============================================================================
 if __name__ == "__main__":
     parser = get_parser()
-    args = parser.parse_args()
-    cuda_available = torch.cuda.is_available()
-    device = torch.device(f"cuda:{args.gpu}" if cuda_available else "cpu")
+    args   = parser.parse_args()
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     random_initialization(args.seed)
 
-    if args.dataset == "CIFAR-100" or args.dataset == "CUB-200-2011" or args.dataset == "VTAB":
+    # [YC3] data_augmentation='vit' → load_dataset.py sẽ dùng
+    #        Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]) → ảnh về [-1,1]
+    print(f"[YC3] data_augmentation='{args.data_augmentation}' → "
+          f"{'[-1,1] normalization (Paper Appendix C.3)' if args.data_augmentation == 'vit' else 'other'}")
+
+    if args.dataset in ("CIFAR-100", "CUB-200-2011", "VTAB"):
         print("Load and Split CIL Dataset...")
         train_loader, test_loader = load_dataset(args)
         print("Load and Split CIL Dataset Done")
@@ -253,168 +308,129 @@ if __name__ == "__main__":
     pretrained_model.out_dim = args.embedding_dim
     pretrained_model.eval()
     pretrained_model.to(device)
-    
-    # TODO: RAPID - [Random Projection Matrix Init — Growable]
-    # Task 1: khởi tạo block chiếu ban đầu kích thước (expand_dim × embedding_dim).
-    # Task t>1: sinh block mới (expand_dim × embedding_dim) và nối row-wise vào P,
-    #           tạo không gian (t * expand_dim) × embedding_dim.
-    # Biến projection_matrix luôn là dense tensor; chuyển sang sparse khi dùng.
-    non_zero_per_col = args.synaptic_degree
-    # Khởi tạo block chiếu cho Task 0: (neurons_per_task × embedding_dim)
-    # Sau khi có num_classes_per_task ở trên, dùng tạm biến neurons_per_task_init
-    _npt = args.expand_dim // args.num_tasks
-    projection_matrix = _make_sparse_projection_block(
-        num_neurons=_npt,
-        embedding_dim=args.embedding_dim,
-        non_zero_per_row=non_zero_per_col,
-        device=device,
-    )  # Dense (_npt, embedding_dim) — block của Task 0
 
-    acc = {}
-    training_time = []
+    # --- Khởi tạo ---
+    non_zero_per_col  = args.synaptic_degree
+    neurons_budget    = args.expand_dim // args.num_tasks   # budget mỗi task
+    projection_matrix = None
+
+    # [YC1] Lưu kích thước từng block — cần thiết cho block-wise WTA
+    block_sizes: list[int] = []
+
+    # [YC2] Prototype Classifier — thay thế Ridge + UnifiedCosineClassifier
+    classifier = PrototypeClassifier(device=device)
+
+    acc                  = {}
+    training_time        = []
     feature_extract_time = []
 
-    # Ridge Regression dùng per-task (không cần global Q/G vì classes không sequential)
+    print(f"\nConfig: budget={neurons_budget} neurons/task | "
+          f"coding_level={args.coding_level}/block | "
+          f"fisher_block={args.fisher_block} | fisher_sat={args.fisher_sat}")
+    print("Start Continual Learning\n")
 
-    # neurons_per_task: số neuron mỗi task nhận được.
-    # Tổng D sau num_tasks task = expand_dim (bằng baseline → fair comparison).
-    # VD: expand_dim=10000, num_tasks=10 → mỗi task 1000 neuron, task 9 D=10000.
-    num_classes_per_task  = args.num_classes // args.num_tasks
-    neurons_per_task      = args.expand_dim  // args.num_tasks
-    classifier = UnifiedCosineClassifier(
-        init_dim=neurons_per_task,
-        num_total_classes=args.num_classes,
-        device=device,
-    )
-    print(f"RAPID config: {neurons_per_task} neurons/task, "
-          f"total D at task-{args.num_tasks-1} = {args.expand_dim}")
-    print("Start Continual Learning")
     for task in range(args.num_tasks):
-        acc[task] = []
+        acc[task]      = []
         training_start = time.time()
 
-        # TODO: RAPID - [Projection Matrix Grow — Task t > 0]
-        # Khi sang task mới, sinh thêm một block chiếu (expand_dim × embedding_dim)
-        # và nối row-wise vào projection_matrix hiện tại:
-        #   P_{t} = cat([P_{t-1}, new_block], dim=0)  → shape: (t*k × d_in)
-        # Đồng thời, grow W trong classifier: zero-pad m hàng mới cho class cũ.
-        if task > 0:
-            new_block = _make_sparse_projection_block(
-                num_neurons=neurons_per_task,      # ← mỗi task chỉ thêm neurons_per_task hàng
-                embedding_dim=args.embedding_dim,
-                non_zero_per_row=non_zero_per_col,
-                device=device,
-            )
-            projection_matrix = torch.cat([projection_matrix, new_block], dim=0)
-            del new_block                          # giải phóng ngay sau khi cat
-            classifier.grow_projection(num_new_neurons=neurons_per_task)
-            print(f"[Task {task}] D = {projection_matrix.shape[0]} neurons "
-                  f"(target: {args.expand_dim} at task {args.num_tasks-1})")
-
-        # Kích thước hiện tại của không gian chiếu
-        current_proj_dim = projection_matrix.shape[0]  # t * expand_dim
-        # Số neuron WTA top-k (giữ coding_level% trên tổng chiều hiện tại)
-        topk_neurons = max(1, int(current_proj_dim * args.coding_level))
-
-        feature_extract_start = time.time()
-        train_embeddings, train_labels = feature_extract(pretrained_model, train_loader[task], device)
-        feature_extract_end = time.time()
-        feature_extract_time.append(feature_extract_end - feature_extract_start)
-
-        # TODO: RAPID - [Feature Extraction via Projection (Train)]
-        # Bước 1: chiếu lên không gian (current_proj_dim × d_in) — đã grow.
-        # Bước 2: WTA top-k trên toàn bộ current_proj_dim neuron.
-        # Lưu ý: projection_matrix là dense tensor, chuyển sang sparse khi nhân.
-        proj_sparse = projection_matrix.to_sparse_csc()
-        train_embeddings = torch.sparse.mm(proj_sparse, train_embeddings.T)  # (D, N)
-        values, indices = train_embeddings.topk(topk_neurons, dim=0, largest=True)
-        output = torch.zeros_like(train_embeddings)
-        output.scatter_(0, indices, values)
-        del values, indices, train_embeddings    # giải phóng 3 tensor lớn trước khi tiếp tục
-        train_embeddings = output
-
-        actual_classes   = sorted([int(c) for c in train_labels.unique().cpu().tolist()])
-        num_task_classes = len(actual_classes)
-        g2l = {g: l for l, g in enumerate(actual_classes)}
-        local_labels = torch.tensor(
-            [g2l[int(lb)] for lb in train_labels.cpu().tolist()],
-            dtype=torch.long, device=device
+        # --- Feature extraction (backbone frozen) ---
+        t0 = time.time()
+        train_embeddings, train_labels = feature_extract(
+            pretrained_model, train_loader[task], device
         )
-        Y_local = target2onehot(local_labels, num_task_classes)
+        feature_extract_time.append(time.time() - t0)
 
-        # Dual Ridge Regression: giải hệ (N×N) thay vì (D×D)
-        X      = train_embeddings.T                    # (N, D)
-        N_samp = X.shape[0]
-        G_dual = X @ X.T                               # (N, N) — lưu lại để dùng cho GCV
-        ridge  = select_ridge_parameter(X, Y_local, args.ridge_lower, args.ridge_upper,
-                                        G_dual_precomputed=G_dual)   # tránh tính G_dual 2 lần
-        L      = torch.linalg.cholesky(G_dual + ridge * torch.eye(N_samp, device=device))
-        alpha  = torch.cholesky_solve(Y_local, L)      # (N, K)
-        Wo_task = X.T @ alpha                          # (D, K)
-        del G_dual, L, alpha, X                        # giải phóng bộ nhớ để fit()
+        # --- Fisher-adaptive projection block ---
+        print(f"[Task {task:02d}] Fisher-adaptive projection (budget={neurons_budget}):")
+        new_block  = adaptive_projection_size(
+            train_embs=train_embeddings,
+            train_labels=train_labels,
+            embedding_dim=args.embedding_dim,
+            synaptic_degree=non_zero_per_col,
+            max_neurons=neurons_budget,
+            block_size=args.fisher_block,
+            saturation_threshold=args.fisher_sat,
+            device=device,
+        )
+        adaptive_m = new_block.shape[0]
+
+        # [YC1] Ghi nhớ kích thước block vừa thêm
+        block_sizes.append(adaptive_m)
+
+        # Grow projection matrix + grow prototypes
+        if projection_matrix is None:
+            projection_matrix       = new_block
+            classifier._current_dim = adaptive_m
+        else:
+            projection_matrix = torch.cat([projection_matrix, new_block], dim=0)
+            # [YC2] Zero-pad prototype cũ để khớp chiều mới
+            classifier.grow(num_new_neurons=adaptive_m)
+        del new_block
+
+        D_total = projection_matrix.shape[0]
+        print(f"[Task {task:02d}] D_total={D_total} | new_block={adaptive_m} | "
+              f"block_sizes={block_sizes}")
+
+        # --- Projection + [YC1] Block-wise Absolute WTA (Train) ---
+        proj_sparse  = projection_matrix.to_sparse_csc()
+        H_full_train = torch.sparse.mm(proj_sparse, train_embeddings.T)  # (D, N)
+
+        # [YC1] WTA per-block với absolute top-k (giữ nguyên dấu âm/dương)
+        H_wta_train  = blockwise_wta(H_full_train, block_sizes, args.coding_level)
+        del H_full_train
+
+        # --- [YC2] Cập nhật Prototype cho các class mới của task này ---
+        actual_classes = sorted([int(c) for c in train_labels.unique().cpu().tolist()])
+        classifier.update(H_wta_train.T.contiguous(), train_labels, actual_classes)
+        del H_wta_train, train_embeddings
+
         torch.cuda.empty_cache()
-        training_end = time.time()
-        training_time.append(training_end - training_start)
+        training_time.append(time.time() - training_start)
 
-        classifier.expand(num_new_classes=num_task_classes)
-        classifier.fit(Wo_task=Wo_task, task_class_indices=actual_classes)
-        del Wo_task
-
+        # --- Evaluation trên tất cả sub-tasks đã học ---
         for sub_task in range(task + 1):
-            test_embeddings, test_labels = feature_extract(pretrained_model, test_loader[sub_task], device)
-            test_embeddings = torch.sparse.mm(proj_sparse, test_embeddings.T)
-            values, indices = test_embeddings.topk(topk_neurons, dim=0, largest=True)
-            output = torch.zeros_like(test_embeddings)
-            output.scatter_(0, indices, values)
-            del values, indices, test_embeddings
-            test_embeddings_dense = output
-            test_accuracy = classifier.evaluate(test_embeddings_dense, test_labels)
-            del test_embeddings_dense
-            acc[sub_task].append(test_accuracy)
+            test_embeddings, test_labels = feature_extract(
+                pretrained_model, test_loader[sub_task], device
+            )
+            H_full_test = torch.sparse.mm(proj_sparse, test_embeddings.T)  # (D, N_test)
+            del test_embeddings
 
-        del proj_sparse, train_embeddings
+            # [YC1] Cùng block-wise absolute WTA — block_sizes giống train
+            H_wta_test  = blockwise_wta(H_full_test, block_sizes, args.coding_level)
+            del H_full_test
+
+            # [YC2] Predict bằng Cosine Similarity với Prototypes
+            acc_val = classifier.evaluate(H_wta_test.T, test_labels)
+            del H_wta_test
+            acc[sub_task].append(acc_val)
+
+        del proj_sparse
         torch.cuda.empty_cache()
+        print(f"[Task {task:02d}] Done | train_time={training_time[-1]:.2f}s\n")
 
-    # display acc_matrix
-    acc_matrix = [["{:.2f}".format(0.00) for _ in range(args.num_tasks)] for _ in range(len(acc))]
-    for i, (task, values) in enumerate(acc.items()):
-        for j, value in enumerate(values):
-            acc_matrix[i][i + j] = round(value, 2)
-    
-    print("Accuracy Matrix")
+    # =================================================================
+    # Hiển thị kết quả
+    # =================================================================
+    acc_matrix = [[0.0] * args.num_tasks for _ in range(args.num_tasks)]
+    for i, (task_i, vals) in enumerate(acc.items()):
+        for j, v in enumerate(vals):
+            acc_matrix[i][i + j] = round(v, 2)
+
+    print("\n" + "=" * 60)
+    print("Accuracy Matrix (row=task_id, col=evaluated_at_task)")
     for row in acc_matrix:
         print(row)
-    print()
 
-    print("Average Accuracy")
+    print("\nAverage Accuracy A_t (per task column)")
     A_t = []
     for j in range(args.num_tasks):
-        cnt = 0.0
-        for i in range(j + 1):
-            cnt += acc_matrix[i][j]
-        cnt /= (j + 1)
+        cnt = sum(acc_matrix[i][j] for i in range(j + 1)) / (j + 1)
         A_t.append(cnt)
-        print(round(cnt, 2), end=", ")
-    print("\n")
+        print(f"  Task {j}: {round(cnt, 2)}")
 
-    print("Accumulated Accuracy")
-    print(round(np.mean(A_t), 2))
-    print()
+    print(f"\nAccumulated Accuracy (A_bar): {round(float(np.mean(A_t)), 2)}")
 
-    print("Training Time")
-    for task_time in training_time:
-        print(round(task_time, 2), end=", ")
-    print("\n")
-
-    print("Average Training Time")
-    print(round(np.mean(training_time), 2))
-    print()
-
-    print("Feature Extract Time")
-    for task_time in feature_extract_time:
-        print(round(task_time, 2), end=", ")
-    print("\n")
-
-    print("Average Feature Extract Time")
-    print(round(np.mean(feature_extract_time), 2))
-    print()
+    print(f"\nTraining Time:        {[round(t, 2) for t in training_time]}")
+    print(f"Avg Training Time:    {round(float(np.mean(training_time)), 2)}s")
+    print(f"Feature Extract Time: {[round(t, 2) for t in feature_extract_time]}")
+    print(f"Avg Extract Time:     {round(float(np.mean(feature_extract_time)), 2)}s")
