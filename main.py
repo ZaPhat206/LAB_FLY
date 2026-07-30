@@ -223,14 +223,17 @@ def create_etf_prototypes(num_classes: int, feat_dim: int) -> torch.Tensor:
 
     C, D = num_classes, feat_dim
 
-    # Bước 1: Tạo ma trận U_base (C, D) với các hàng trực chuẩn
-    # QR phân rã ma trận ngẫu nhiên (D, C) → Q: (D, C) orthonormal
-    rand_mat = torch.randn(D, C)
-    Q, _ = torch.linalg.qr(rand_mat)          # Q: (D, C)
-    U_base = Q.T                               # (C, D) với các hàng trực giao
+    # Bước 1: Tạo ma trận U_base (C, D) với các hàng/cột trực chuẩn
+    if D >= C:
+        rand_mat = torch.randn(D, C)
+        Q, _ = torch.linalg.qr(rand_mat)          # Q: (D, C)
+        U_base = Q.T                              # (C, D)
+    else:
+        rand_mat = torch.randn(C, C)
+        Q, _ = torch.linalg.qr(rand_mat)          # Q: (C, C)
+        U_base = Q[:, :D]                         # (C, D)
 
     # Bước 2: Áp dụng Centering Matrix H để tạo ETF
-    # H = I_C - (1/C)*11^T  →  HTF: p_i·p_j = -1/(C-1)
     ones  = torch.ones(C, 1)
     H_ctr = torch.eye(C) - (1.0 / C) * (ones @ ones.T)   # (C, C)
     scale = torch.sqrt(torch.tensor(C / (C - 1.0)))
