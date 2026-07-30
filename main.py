@@ -178,9 +178,10 @@ def blockwise_wta(
         blk = H_full[offset: offset + bs, :]          # (bs, N)
         k   = max(1, int(bs * coding_level))
 
-        # [Exp 3] Positive-only Top-k (thay thế Absolute Top-k để kiểm chứng)
-        # Chỉ giữ k activation dương lớn nhất — bỏ qua activation âm
-        topk_vals, topk_idx = blk.topk(k, dim=0, largest=True)  # (k, N)
+        # [YC1 CORE] Top-k theo độ lớn |x| (không phải largest positive)
+        _, topk_idx = torch.abs(blk).topk(k, dim=0)   # (k, N) — index
+        # Lấy giá trị thực (giữ nguyên dấu âm/dương) tại các index đó
+        topk_vals   = torch.gather(blk, dim=0, index=topk_idx)  # (k, N)
 
         blk_sparse  = torch.zeros_like(blk)
         blk_sparse.scatter_(0, topk_idx, topk_vals)   # (bs, N)
@@ -308,16 +309,23 @@ if __name__ == "__main__":
     pretrained_model.eval()
     pretrained_model.to(device)
 
-    # --- Khởi tạo ---
+    # --- Khởi tạo tĩnh (Thí nghiệm 1: Tắt Growable) ---
     non_zero_per_col  = args.synaptic_degree
-    neurons_budget    = args.expand_dim // args.num_tasks   # budget mỗi task
-    projection_matrix = None
-
-    # [YC1] Lưu kích thước từng block — cần thiết cho block-wise WTA
-    block_sizes: list[int] = []
+    
+    print(f"Khởi tạo tĩnh ma trận chiếu D_total = {args.expand_dim}...")
+    projection_matrix = _make_sparse_projection_block(
+        num_neurons=args.expand_dim,
+        embedding_dim=args.embedding_dim,
+        non_zero_per_row=non_zero_per_col,
+        device=device
+    )
+    
+    # Coi toàn bộ ma trận như 1 block duy nhất
+    block_sizes = [args.expand_dim]
 
     # [YC2] Prototype Classifier — thay thế Ridge + UnifiedCosineClassifier
     classifier = PrototypeClassifier(device=device)
+    classifier._current_dim = args.expand_dim  # Set cứng không gian 10000 chiều ngay từ đầu
 
     acc                  = {}
     training_time        = []
@@ -339,36 +347,9 @@ if __name__ == "__main__":
         )
         feature_extract_time.append(time.time() - t0)
 
-        # --- Fisher-adaptive projection block ---
-        print(f"[Task {task:02d}] Fisher-adaptive projection (budget={neurons_budget}):")
-        new_block  = adaptive_projection_size(
-            train_embs=train_embeddings,
-            train_labels=train_labels,
-            embedding_dim=args.embedding_dim,
-            synaptic_degree=non_zero_per_col,
-            max_neurons=neurons_budget,
-            block_size=args.fisher_block,
-            saturation_threshold=args.fisher_sat,
-            device=device,
-        )
-        adaptive_m = new_block.shape[0]
-
-        # [YC1] Ghi nhớ kích thước block vừa thêm
-        block_sizes.append(adaptive_m)
-
-        # Grow projection matrix + grow prototypes
-        if projection_matrix is None:
-            projection_matrix       = new_block
-            classifier._current_dim = adaptive_m
-        else:
-            projection_matrix = torch.cat([projection_matrix, new_block], dim=0)
-            # [YC2] Zero-pad prototype cũ để khớp chiều mới
-            classifier.grow(num_new_neurons=adaptive_m)
-        del new_block
-
-        D_total = projection_matrix.shape[0]
-        print(f"[Task {task:02d}] D_total={D_total} | new_block={adaptive_m} | "
-              f"block_sizes={block_sizes}")
+        # --- Bỏ qua Fisher-adaptive (Thí nghiệm 1) ---
+        print(f"[Task {task:02d}] Sử dụng ma trận chiếu tĩnh (D_total={args.expand_dim})")
+        # D_total luôn bằng expand_dim, không grow nữa
 
         # --- Projection + [YC1] Block-wise Absolute WTA (Train) ---
         proj_sparse  = projection_matrix.to_sparse_csc()
