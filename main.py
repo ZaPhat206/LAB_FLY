@@ -46,6 +46,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--coding_level',    type=float, default=0.01,
                         help='Top-k ratio per block (default=0.01 for better sparsity)')
 
+
+    parser.add_argument('--classifier_type', type=str, default='ncm',
+                        choices=['ncm', 'ridge_subspace', 'ridge'],
+                        help='Type of classifier: ncm, ridge_subspace, ridge')
+    parser.add_argument('--use_subspace', action='store_true', default=False,
+                        help='Enable subspace extraction for ridge_subspace')
     # [ETF] Bật/Tắt căn chỉnh Procrustes
     parser.add_argument('--use_procrustes', action='store_true',
                         help='Sử dụng ETF Prototypes và Procrustes Alignment')
@@ -254,40 +260,68 @@ def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
 # [YC2] Prototype Classifier — NCM + Cosine Similarity
 #        Thay thế toàn bộ Ridge Regression + UnifiedCosineClassifier
 # =============================================================================
-class PrototypeClassifier:
-    """
-    [YC2] Nearest-Class-Mean Classifier với Cosine Similarity.
 
-    Lưu prototype μ_c = mean(h | y=c) cho mỗi class c đã thấy.
-    Khi thêm block mới (D tăng), zero-pad prototype cũ để nhất quán chiều.
-    Predict: ŷ = argmax_c cosine(h, μ_c).
+def select_ridge_parameter(H, Y, lambdas=None):
+    if lambdas is None:
+        lambdas = [10**i for i in range(-5, 6)]
+    N = H.shape[0]
+    best_lambda = lambdas[0]
+    best_score = float('inf')
+    
+    HTH = H.T @ H
+    HTY = H.T @ Y
+    
+    for l in lambdas:
+        G = HTH + l * torch.eye(H.shape[1], device=H.device)
+        try:
+            L = torch.linalg.cholesky(G)
+            Wo = torch.cholesky_solve(HTY, L)
+            Y_pred = H @ Wo
+            error = torch.norm(Y - Y_pred, p='fro') ** 2
+            
+            G_inv = torch.cholesky_inverse(L)
+            tr_H_hat = H.shape[1] - l * torch.trace(G_inv)
+            
+            denominator = (1 - tr_H_hat / N) ** 2
+            gcv_score = error / (N * denominator)
+            if gcv_score < best_score:
+                best_score = gcv_score
+                best_lambda = l
+        except Exception:
+            continue
+    return best_lambda
 
-    Ưu điểm so với Ridge trong kiến trúc grow:
-      • Không có direction bias khi zero-pad (cosine normalize 2 vế).
-      • Không cần hyperparameter λ — không cần GCV.
-      • Training O(N·D), không O(N²·D).
-      • Block-wise WTA đã làm các block trực giao → NCM đủ mạnh.
-    """
-
-    def __init__(self, device: torch.device, use_procrustes: bool = False, num_prototypes: int = 3):
+class UnifiedClassifier:
+    def __init__(self, device: torch.device, args):
         self.device = device
-        self.use_procrustes = use_procrustes
-        self.num_prototypes = num_prototypes
-        # global_class_idx → prototype tensor (K, D)
-        self.prototypes: dict[int, torch.Tensor] = {}
-        self.etf_prototypes: dict[int, torch.Tensor] = {}
-        self.R: torch.Tensor | None = None
-        self._current_dim: int = 0
+        self.args = args
+        self.classifier_type = args.classifier_type
+        self.use_procrustes = args.use_procrustes
+        self.num_prototypes = args.num_prototypes
+        self.use_subspace = args.use_subspace
+        
+        if self.classifier_type == 'ridge_subspace' and not self.use_subspace:
+            print("Warning: ridge_subspace selected but --use_subspace is False. Falling back to ridge.")
+            self.classifier_type = 'ridge'
+            
+        self.prototypes = {}
+        self.etf_prototypes = {}
+        self.R = None
+        self.V_r = None
+        self._current_dim = 0
+        
+        # Cho Ridge
+        self.G_global = None
+        self.Q_global = None
+        self.Wo = None
+        self.last_H = None
+        self.last_Y = None
 
     @property
     def current_dim(self) -> int:
         return self._current_dim
 
     def grow(self, num_new_neurons: int) -> None:
-        """
-        [YC2 - Zero-Padding] Khi projection mở rộng thêm num_new_neurons chiều,
-        zero-pad cuối mỗi prototype cũ để giữ nhất quán số chiều D.
-        """
         pad = torch.zeros(self.num_prototypes, num_new_neurons, device=self.device)
         for cls_idx in self.prototypes:
             self.prototypes[cls_idx] = torch.cat(
@@ -295,17 +329,15 @@ class PrototypeClassifier:
             )
         self._current_dim += num_new_neurons
 
-    def update(
-        self,
-        H: torch.Tensor,            # (N, D) dense — sau block-wise WTA
-        labels: torch.Tensor,       # (N,) global class labels
-        actual_classes: list[int],  # global class idx của task hiện tại
-    ) -> None:
-        """
-        Dùng K-Means phân cụm H[y==c] thành K prototypes.
-        """
+    def update(self, H: torch.Tensor, labels: torch.Tensor, actual_classes: list[int]) -> None:
         H_dev = H.to(self.device)
-        lbl   = labels.to(self.device)
+        lbl = labels.to(self.device)
+        
+        self.last_H = H_dev
+        from utils import target2onehot
+        self.last_Y = target2onehot(lbl, self.args.num_classes).float().to(self.device)
+        
+        # 1. Update prototypes (K-means cho NCM, hoặc mean bình thường)
         for cls in actual_classes:
             mask = (lbl == cls)
             if mask.sum() == 0:
@@ -313,116 +345,165 @@ class PrototypeClassifier:
             
             features_c = H_dev[mask]
             N_c = features_c.shape[0]
-            K_c = min(self.num_prototypes, N_c)
             
-            if K_c == 1:
-                protos = features_c.mean(dim=0, keepdim=True)
+            if self.classifier_type == 'ncm':
+                K_c = min(self.num_prototypes, N_c)
+                if K_c <= 1:
+                    protos = features_c.mean(dim=0, keepdim=True)
+                else:
+                    from sklearn.cluster import KMeans
+                    kmeans = KMeans(n_clusters=K_c, n_init=10, random_state=42)
+                    kmeans.fit(features_c.cpu().numpy())
+                    protos = torch.tensor(kmeans.cluster_centers_, device=self.device, dtype=features_c.dtype)
+                
+                if K_c < self.num_prototypes:
+                    mean_proto = features_c.mean(dim=0, keepdim=True)
+                    pad = mean_proto.repeat(self.num_prototypes - K_c, 1)
+                    protos = torch.cat([protos, pad], dim=0)
             else:
-                kmeans = KMeans(n_clusters=K_c, n_init=10, random_state=42)
-                # KMeans trên CPU
-                kmeans.fit(features_c.cpu().numpy())
-                protos = torch.tensor(kmeans.cluster_centers_, device=self.device, dtype=features_c.dtype)
-            
-            # Pad nếu N_c < num_prototypes để luôn có shape (K, D)
-            if K_c < self.num_prototypes:
-                mean_proto = features_c.mean(dim=0, keepdim=True)
-                pad = mean_proto.repeat(self.num_prototypes - K_c, 1)
-                protos = torch.cat([protos, pad], dim=0)
+                # Với Ridge, chỉ cần 1 mean (để làm SVD)
+                protos = features_c.mean(dim=0, keepdim=True)
                 
             self.prototypes[cls] = protos.detach()
             
         if self._current_dim == 0:
             self._current_dim = H.shape[1]
 
-    def align_prototypes(self) -> None:
-        """
-        Khởi tạo ETF Prototypes và tìm ma trận xoay R để gióng hàng
-        Empirical Means (M) khớp với ETF Prototypes (P).
-        Chỉ chạy nếu tính năng này được bật (use_procrustes = True).
-        """
-        if not self.use_procrustes:
-            return
+        # 2. Update G_global và Q_global cho Ridge
+        if self.classifier_type in ['ridge', 'ridge_subspace']:
+            new_G = H_dev.T @ H_dev
+            new_Q = H_dev.T @ self.last_Y
+            
+            if self.G_global is None:
+                self.G_global = new_G
+                self.Q_global = new_Q
+            else:
+                self.G_global += new_G
+                self.Q_global += new_Q
 
-        sorted_cls  = sorted(self.prototypes.keys())
+    def align_prototypes(self) -> None:
+        sorted_cls = sorted(self.prototypes.keys())
         num_classes = len(sorted_cls)
 
-        # Chỉ align khi đủ class và đủ chiều
-        if num_classes < 3 or self._current_dim < num_classes - 1:
-            return
-
-        # ── Tạo ETF Prototypes P (C, D) bằng công thức chuẩn ──────────────────
-        P = create_etf_prototypes(num_classes, self._current_dim).to(self.device)
-
-        # ── Tạo Empirical Means M (C, D) ──────────────────────────────────────
-        # Lấy mean của K prototypes cho mỗi class để tính M
-        M_raw = torch.stack([self.prototypes[c].mean(dim=0) for c in sorted_cls], dim=0)
-        M     = F.normalize(M_raw.float(), p=2, dim=1).to(self.device)
-
-        # ── Tìm ma trận xoay R bằng Procrustes ────────────────────────────────
-        self.R = procrustes_alignment(M, P)
-
-        # ── Kiểm tra tính trực giao (log) ─────────────────────────────────────
-        # R là D×D, kiểm tra trên sub-space: ||R[:C].T @ R[:C] - I_C||_F
-        R_sub   = self.R[:num_classes, :]      # (C, D)
-        eye_err = torch.norm(R_sub @ R_sub.T - torch.eye(num_classes, device=self.device))
-        print(f"    [ETF-Procrustes] C={num_classes:3d} | "
-              f"ortho_err={eye_err:.4f} | R.shape={tuple(self.R.shape)}")
-
-        # ── Lưu lại ETF Prototypes tương ứng cho từng class ───────────────────
-        self.etf_prototypes = {c: P[i].detach() for i, c in enumerate(sorted_cls)}
+        if self.classifier_type == 'ncm':
+            if not self.use_procrustes or num_classes < 3 or self._current_dim < num_classes - 1:
+                return
+            P = create_etf_prototypes(num_classes, self._current_dim).to(self.device)
+            M_raw = torch.stack([self.prototypes[c].mean(dim=0) for c in sorted_cls], dim=0)
+            M = F.normalize(M_raw.float(), p=2, dim=1).to(self.device)
+            self.R = procrustes_alignment(M, P)
+            self.etf_prototypes = {c: P[i].detach() for i, c in enumerate(sorted_cls)}
+            
+        elif self.classifier_type == 'ridge_subspace':
+            # Subspace Extraction
+            if num_classes < 2:
+                # Quá ít lớp, fallback về ridge gốc hoặc identity
+                self.V_r = None
+                self.R = None
+                best_lam = 0.1
+                G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
+                L = torch.linalg.cholesky(G_reg)
+                self.Wo = torch.cholesky_solve(self.Q_global, L)
+                return
+                
+            # Tạo M từ mean của các class
+            M_raw = torch.cat([self.prototypes[c] for c in sorted_cls], dim=0) # (C, D)
+            
+            # SVD: U, S, V = torch.svd(M)
+            U, S, Vh = torch.linalg.svd(M_raw, full_matrices=False)
+            r = min(num_classes - 1, (S > 1e-6).sum().item())
+            if r == 0: r = 1
+            
+            self.V_r = Vh[:r, :].T # (D, r)
+            
+            if self.use_procrustes and num_classes >= 3:
+                P = create_etf_prototypes(num_classes, r).to(self.device)
+                M_proj = M_raw @ self.V_r
+                M_proj_norm = F.normalize(M_proj, p=2, dim=1)
+                self.R = procrustes_alignment(M_proj_norm, P)
+            else:
+                self.R = None
+                
+            # P_proj
+            if self.R is not None:
+                P_proj = self.V_r @ self.R
+            else:
+                P_proj = self.V_r
+                
+            # Vi V_r và R thay đổi mỗi task, Q và G phải được cộng dồn ở không gian gốc 10000D, 
+            # sau đó chiếu xuống không gian con mới bằng P_proj để đảm bảo tính đúng đắn toán học.
+            G_proj = P_proj.T @ self.G_global @ P_proj # (r, r)
+            Q_proj = P_proj.T @ self.Q_global # (r, C)
+            
+            # GCV trên H_aligned của task hiện tại
+            H_aligned = self.last_H @ P_proj
+            best_lam = select_ridge_parameter(H_aligned, self.last_Y)
+            
+            print(f"    [Ridge Subspace] C={num_classes:3d}, r={r}, best_lam={best_lam}")
+            
+            G_reg = G_proj + best_lam * torch.eye(G_proj.shape[0], device=self.device)
+            L = torch.linalg.cholesky(G_reg)
+            self.Wo = torch.cholesky_solve(Q_proj, L)
+            
+        elif self.classifier_type == 'ridge':
+            # Giải Ridge gốc 10000D
+            best_lam = 0.1 # Tránh GCV trên 10000D vì quá chậm
+            print(f"    [Ridge] C={num_classes:3d}, Full D={self._current_dim}")
+            G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
+            try:
+                L = torch.linalg.cholesky(G_reg)
+                self.Wo = torch.cholesky_solve(self.Q_global, L)
+            except:
+                self.Wo = torch.linalg.solve(G_reg, self.Q_global)
 
     def predict(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        [YC2] ŷ = argmax_c max_k cosine(h, μ_{c,k}).
-
-        Args:
-            z : (N, D) hoặc (D, N).
-        Returns:
-            global class indices (N,) on CPU.
-        """
         if z.dim() == 2 and z.shape[1] != self._current_dim:
-            z = z.T   # (D, N) → (N, D)
+            z = z.T
 
         z_float = z.float().to(self.device)
-        z_norm = F.normalize(z_float, p=2, dim=1)   # (N, D)
 
-        if self.R is not None and len(self.etf_prototypes) > 0:
-            # [ETF mode] Xoay prototypes về z-space thay vì xoay z
-            # P_rot = P @ R.T  ≈ M (empirical means)  →  tương đương về lý thuyết
-            # nhưng tránh được nhân (N, D) x (D, D) lớn khi N nhỏ
-            sorted_cls = sorted(self.etf_prototypes.keys())
-            P_etf = torch.stack(
-                [self.etf_prototypes[c] for c in sorted_cls], dim=0
-            )                                               # (C, D)
-            # Xoay ngược ETF về không gian empirical
-            P = P_etf @ self.R.T                           # (C, D)
-            P_norm = F.normalize(P,       p=2, dim=1)   # (C, D)
-            sim    = z_norm @ P_norm.T                  # (N, C)
-            local_preds = sim.argmax(dim=1)
-        else:
-            # Dùng K Empirical Prototypes
+        if self.classifier_type == 'ncm':
+            z_norm = F.normalize(z_float, p=2, dim=1)
             sorted_cls = sorted(self.prototypes.keys())
-            P = torch.cat(
-                [self.prototypes[c] for c in sorted_cls], dim=0
-            ).float()                                      # (C * K, D)
             
-            P_norm = F.normalize(P, p=2, dim=1)            # (C * K, D)
-            sim = z_norm @ P_norm.T                        # (N, C * K)
+            if self.use_procrustes and self.R is not None and len(self.etf_prototypes) > 0:
+                P_etf = torch.stack([self.etf_prototypes[c] for c in sorted_cls], dim=0)
+                P = P_etf @ self.R.T
+                P_norm = F.normalize(P, p=2, dim=1)
+                sim = z_norm @ P_norm.T
+                local_preds = sim.argmax(dim=1)
+            else:
+                P = torch.cat([self.prototypes[c] for c in sorted_cls], dim=0).float()
+                P_norm = F.normalize(P, p=2, dim=1)
+                sim = z_norm @ P_norm.T
+                sim = sim.view(z_norm.shape[0], len(sorted_cls), self.num_prototypes)
+                sim_max, _ = sim.max(dim=2)
+                local_preds = sim_max.argmax(dim=1)
+                
+            cls_t = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
+            return cls_t[local_preds].cpu()
             
-            # Reshape để tìm max cosine trong K prototypes của mỗi class
-            # sim: (N, C, K)
-            sim = sim.view(z_norm.shape[0], len(sorted_cls), self.num_prototypes)
-            sim_max, _ = sim.max(dim=2)                    # (N, C)
-            local_preds = sim_max.argmax(dim=1)
-
-        cls_t       = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
-        return cls_t[local_preds].cpu()
+        elif self.classifier_type == 'ridge_subspace':
+            if self.V_r is not None:
+                H_test_proj = z_float @ self.V_r
+                if self.R is not None:
+                    H_test_aligned = H_test_proj @ self.R
+                else:
+                    H_test_aligned = H_test_proj
+                logits = H_test_aligned @ self.Wo
+            else:
+                logits = z_float @ self.Wo
+            return logits.argmax(dim=1).cpu()
+            
+        elif self.classifier_type == 'ridge':
+            logits = z_float @ self.Wo
+            return logits.argmax(dim=1).cpu()
 
     def evaluate(self, H: torch.Tensor, labels: torch.Tensor) -> float:
-        """Wrapper: trả về accuracy (%)."""
         if H.is_sparse:
             H = H.to_dense()
         preds = self.predict(H)
+        return (preds == labels.cpu()).float().mean().item() * 100.0
         return (preds == labels.cpu()).float().mean().item() * 100.0
 
 
@@ -465,11 +546,7 @@ if __name__ == "__main__":
     block_sizes = [args.expand_dim]
 
     # [YC2] Prototype Classifier — thay thế Ridge + UnifiedCosineClassifier
-    classifier = PrototypeClassifier(
-        device=device,
-        use_procrustes=args.use_procrustes,
-        num_prototypes=args.num_prototypes
-    )
+    classifier = UnifiedClassifier(device=device, args=args)
     classifier._current_dim = args.expand_dim  # Set cứng không gian 10000 chiều ngay từ đầu
 
     acc                  = {}
