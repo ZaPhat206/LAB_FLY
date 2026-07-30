@@ -178,10 +178,9 @@ def blockwise_wta(
         blk = H_full[offset: offset + bs, :]          # (bs, N)
         k   = max(1, int(bs * coding_level))
 
-        # [YC1 CORE] Top-k theo độ lớn |x| (không phải largest positive)
-        _, topk_idx = torch.abs(blk).topk(k, dim=0)   # (k, N) — index
-        # Lấy giá trị thực (giữ nguyên dấu âm/dương) tại các index đó
-        topk_vals   = torch.gather(blk, dim=0, index=topk_idx)  # (k, N)
+        # [Exp 3] Positive-only Top-k (thay thế Absolute Top-k để kiểm chứng)
+        # Chỉ giữ k activation dương lớn nhất — bỏ qua activation âm
+        topk_vals, topk_idx = blk.topk(k, dim=0, largest=True)  # (k, N)
 
         blk_sparse  = torch.zeros_like(blk)
         blk_sparse.scatter_(0, topk_idx, topk_vals)   # (bs, N)
