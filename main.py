@@ -331,9 +331,9 @@ if __name__ == "__main__":
     training_time        = []
     feature_extract_time = []
 
-    print(f"\nConfig: budget={neurons_budget} neurons/task | "
+    print(f"\nConfig: D_total={args.expand_dim} (static) | "
           f"coding_level={args.coding_level}/block | "
-          f"fisher_block={args.fisher_block} | fisher_sat={args.fisher_sat}")
+          f"synaptic_degree={args.synaptic_degree}")
     print("Start Continual Learning\n")
 
     for task in range(args.num_tasks):
