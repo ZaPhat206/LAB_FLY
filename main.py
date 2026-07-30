@@ -42,8 +42,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--synaptic_degree', type=int, default=100,
                         help='Non-zero connections per row p')
     # [YC1] coding_level áp dụng PER BLOCK: k = coding_level × block_size
-    parser.add_argument('--coding_level',    type=float, default=0.3,
-                        help='Top-k ratio per block (paper default=0.3)')
+    parser.add_argument('--coding_level',    type=float, default=0.01,
+                        help='Top-k ratio per block (default=0.01 for better sparsity)')
+
+    # [ETF] Bật/Tắt căn chỉnh Procrustes
+    parser.add_argument('--use_procrustes', action='store_true',
+                        help='Sử dụng ETF Prototypes và Procrustes Alignment')
 
     # Fisher-adaptive allocation
     parser.add_argument('--fisher_block', type=int,   default=512,
@@ -192,6 +196,34 @@ def blockwise_wta(
 
 
 # =============================================================================
+# Helper: ETF Prototypes & Procrustes Alignment
+# =============================================================================
+def create_etf_prototypes(num_classes: int, feat_dim: int) -> torch.Tensor:
+    """Tạo ma trận ETF (C, D) ngẫu nhiên -> chuẩn hóa -> SVD trực giao hóa."""
+    # Khi C=1, trả về 1 vector bất kỳ có norm=1
+    if num_classes == 1:
+        return F.normalize(torch.randn(1, feat_dim), p=2, dim=1).cpu()
+
+    random_matrix = torch.randn(num_classes, feat_dim)
+    # Trừ đi mean theo cột để có tổng bằng 0
+    centered_matrix = random_matrix - random_matrix.mean(dim=0, keepdim=True)
+    # SVD
+    U, S, Vh = torch.linalg.svd(centered_matrix, full_matrices=False)
+    # Trực giao hóa
+    orthogonal_matrix = U @ Vh
+    # Chuẩn hóa L2 norm cho từng hàng (prototype)
+    etf_prototypes = F.normalize(orthogonal_matrix, p=2, dim=1)
+    return etf_prototypes.cpu()
+
+def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
+    """Tìm ma trận xoay R (D, D) sao cho M @ R gần P nhất."""
+    P = P.to(M.device)
+    C_mat = M.T @ P
+    U, _, Vh = torch.linalg.svd(C_mat, full_matrices=False)
+    R = U @ Vh
+    return R
+
+# =============================================================================
 # [YC2] Prototype Classifier — NCM + Cosine Similarity
 #        Thay thế toàn bộ Ridge Regression + UnifiedCosineClassifier
 # =============================================================================
@@ -210,10 +242,13 @@ class PrototypeClassifier:
       • Block-wise WTA đã làm các block trực giao → NCM đủ mạnh.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, use_procrustes: bool = False):
         self.device = device
+        self.use_procrustes = use_procrustes
         # global_class_idx → prototype tensor (D,)
         self.prototypes: dict[int, torch.Tensor] = {}
+        self.etf_prototypes: dict[int, torch.Tensor] = {}
+        self.R: torch.Tensor | None = None
         self._current_dim: int = 0
 
     @property
@@ -252,6 +287,34 @@ class PrototypeClassifier:
         if self._current_dim == 0:
             self._current_dim = H.shape[1]
 
+    def align_prototypes(self) -> None:
+        """
+        Khởi tạo ETF Prototypes và tìm ma trận xoay R để gióng hàng
+        Empirical Means (M) khớp với ETF Prototypes (P).
+        Chỉ chạy nếu tính năng này được bật (use_procrustes = True).
+        """
+        if not self.use_procrustes:
+            return
+
+        sorted_cls = sorted(self.prototypes.keys())
+        num_classes = len(sorted_cls)
+        
+        # Nếu số lớp < 3, Procrustes có thể không ổn định, bỏ qua
+        if num_classes < 3 or self._current_dim < num_classes - 1:
+            return
+            
+        # Tạo ETF Prototypes P (C, D)
+        P = create_etf_prototypes(num_classes, self._current_dim).to(self.device)
+        
+        # Tạo Empirical Means M (C, D)
+        M = torch.stack([self.prototypes[c] for c in sorted_cls], dim=0).to(self.device)
+        
+        # Tìm ma trận xoay R bằng Procrustes
+        self.R = procrustes_alignment(M, P)
+        
+        # Lưu lại ETF Prototypes tương ứng cho từng class
+        self.etf_prototypes = {c: P[i].detach() for i, c in enumerate(sorted_cls)}
+
     def predict(self, z: torch.Tensor) -> torch.Tensor:
         """
         [YC2] ŷ = argmax_c cosine(h, μ_c).
@@ -264,14 +327,22 @@ class PrototypeClassifier:
         if z.dim() == 2 and z.shape[1] != self._current_dim:
             z = z.T   # (D, N) → (N, D)
 
-        sorted_cls = sorted(self.prototypes.keys())
-        P          = torch.stack(
-            [self.prototypes[c] for c in sorted_cls], dim=0
-        ).float()                                      # (C, D)
+        z_float = z.float().to(self.device)
 
-        z_norm = F.normalize(z.float(), p=2, dim=1)   # (N, D)
-        P_norm = F.normalize(P,         p=2, dim=1)   # (C, D)
-        sim    = z_norm @ P_norm.T                     # (N, C)
+        if self.R is not None and len(self.etf_prototypes) > 0:
+            # Dùng ETF Prototypes và áp dụng ma trận xoay R
+            sorted_cls = sorted(self.etf_prototypes.keys())
+            P = torch.stack([self.etf_prototypes[c] for c in sorted_cls], dim=0)
+            # Biến đổi z: z_aligned = z @ R
+            z_float = z_float @ self.R
+        else:
+            # Dùng Empirical Means tạm thời
+            sorted_cls = sorted(self.prototypes.keys())
+            P = torch.stack([self.prototypes[c] for c in sorted_cls], dim=0).float()
+
+        z_norm = F.normalize(z_float, p=2, dim=1)   # (N, D)
+        P_norm = F.normalize(P,       p=2, dim=1)   # (C, D)
+        sim    = z_norm @ P_norm.T                  # (N, C)
 
         local_preds = sim.argmax(dim=1)
         cls_t       = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
@@ -324,7 +395,7 @@ if __name__ == "__main__":
     block_sizes = [args.expand_dim]
 
     # [YC2] Prototype Classifier — thay thế Ridge + UnifiedCosineClassifier
-    classifier = PrototypeClassifier(device=device)
+    classifier = PrototypeClassifier(device=device, use_procrustes=args.use_procrustes)
     classifier._current_dim = args.expand_dim  # Set cứng không gian 10000 chiều ngay từ đầu
 
     acc                  = {}
@@ -362,6 +433,7 @@ if __name__ == "__main__":
         # --- [YC2] Cập nhật Prototype cho các class mới của task này ---
         actual_classes = sorted([int(c) for c in train_labels.unique().cpu().tolist()])
         classifier.update(H_wta_train.T.contiguous(), train_labels, actual_classes)
+        classifier.align_prototypes()
         del H_wta_train, train_embeddings
 
         torch.cuda.empty_cache()
