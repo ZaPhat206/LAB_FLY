@@ -397,20 +397,34 @@ if __name__ == "__main__":
             acc_matrix[i][i + j] = round(v, 2)
 
     print("\n" + "=" * 60)
-    print("Accuracy Matrix (row=task_id, col=evaluated_at_task)")
-    for row in acc_matrix:
+    print("\nAccuracy Matrix")
+    for i in range(args.num_tasks):
+        row = []
+        for j in range(args.num_tasks):
+            if i > j:
+                row.append('0.00')
+            else:
+                row.append(acc_matrix[i][j])
         print(row)
 
-    print("\nAverage Accuracy A_t (per task column)")
+    print("\nAverage Accuracy")
     A_t = []
     for j in range(args.num_tasks):
         cnt = sum(acc_matrix[i][j] for i in range(j + 1)) / (j + 1)
-        A_t.append(cnt)
-        print(f"  Task {j}: {round(cnt, 2)}")
+        A_t.append(round(cnt, 2))
+    print(", ".join(str(x) for x in A_t) + ", ")
 
-    print(f"\nAccumulated Accuracy (A_bar): {round(float(np.mean(A_t)), 2)}")
+    print("\nAccumulated Accuracy")
+    print(f"{round(float(np.mean(A_t)), 2)}")
 
-    print(f"\nTraining Time:        {[round(t, 2) for t in training_time]}")
-    print(f"Avg Training Time:    {round(float(np.mean(training_time)), 2)}s")
-    print(f"Feature Extract Time: {[round(t, 2) for t in feature_extract_time]}")
-    print(f"Avg Extract Time:     {round(float(np.mean(feature_extract_time)), 2)}s")
+    print("\nTraining Time")
+    print(", ".join(str(round(t, 2)) for t in training_time) + ", ")
+
+    print("\nAverage Training Time")
+    print(f"{round(float(np.mean(training_time)), 2)}")
+
+    print("\nFeature Extract Time")
+    print(", ".join(str(round(t, 2)) for t in feature_extract_time) + ", ")
+
+    print("\nAverage Feature Extract Time")
+    print(f"{round(float(np.mean(feature_extract_time)), 2)}")
