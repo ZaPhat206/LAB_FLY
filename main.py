@@ -199,30 +199,49 @@ def blockwise_wta(
 # Helper: ETF Prototypes & Procrustes Alignment
 # =============================================================================
 def create_etf_prototypes(num_classes: int, feat_dim: int) -> torch.Tensor:
-    """Tạo ma trận ETF (C, D) ngẫu nhiên -> chuẩn hóa -> SVD trực giao hóa."""
-    # Khi C=1, trả về 1 vector bất kỳ có norm=1
+    """
+    Tạo ETF chuẩn (C, D) với thuộc tính:
+      - ||p_i|| = 1 với mọi i
+      - p_i · p_j = -1/(C-1) với mọi i≠j  (equiangular)
+    Dùng công thức: P = sqrt(C/(C-1)) * H @ U_base
+    với H = I - (1/C)*11^T là centering matrix,
+         U_base là ma trận (C, D) với các hàng trực giao.
+    """
     if num_classes == 1:
         return F.normalize(torch.randn(1, feat_dim), p=2, dim=1).cpu()
 
-    random_matrix = torch.randn(num_classes, feat_dim)
-    # Trừ đi mean theo cột để có tổng bằng 0
-    centered_matrix = random_matrix - random_matrix.mean(dim=0, keepdim=True)
-    # SVD
-    U, S, Vh = torch.linalg.svd(centered_matrix, full_matrices=False)
-    # Trực giao hóa
-    orthogonal_matrix = U @ Vh
-    # Chuẩn hóa L2 norm cho từng hàng (prototype)
-    etf_prototypes = F.normalize(orthogonal_matrix, p=2, dim=1)
-    return etf_prototypes.cpu()
+    C, D = num_classes, feat_dim
+
+    # Bước 1: Tạo ma trận U_base (C, D) với các hàng trực chuẩn
+    # QR phân rã ma trận ngẫu nhiên (D, C) → Q: (D, C) orthonormal
+    rand_mat = torch.randn(D, C)
+    Q, _ = torch.linalg.qr(rand_mat)          # Q: (D, C)
+    U_base = Q.T                               # (C, D) với các hàng trực giao
+
+    # Bước 2: Áp dụng Centering Matrix H để tạo ETF
+    # H = I_C - (1/C)*11^T  →  HTF: p_i·p_j = -1/(C-1)
+    ones  = torch.ones(C, 1)
+    H_ctr = torch.eye(C) - (1.0 / C) * (ones @ ones.T)   # (C, C)
+    scale = torch.sqrt(torch.tensor(C / (C - 1.0)))
+    P_etf = scale * (H_ctr @ U_base)                      # (C, D)
+
+    # Bước 3: Chuẩn hóa từng hàng về unit norm
+    return F.normalize(P_etf, p=2, dim=1).cpu()
+
 
 def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
-    """Tìm ma trận xoay R (D, D) sao cho M @ R gần P nhất."""
-    P = P.to(M.device)
-    C_mat = M.T @ P
-    # Dùng Randomized SVD (svd_lowrank) để tránh treo máy với ma trận 10000x10000
-    # Vì M và P chỉ có tối đa C hàng (số class), rank của C_mat tối đa = C
-    q = min(M.shape[0] + 5, C_mat.shape[0], C_mat.shape[1])
-    U, S, V = torch.svd_lowrank(C_mat, q=q)
+    """
+    Tìm ma trận xoay R (D, D) sao cho M @ R gần P nhất theo Frobenius.
+    Dùng svd_lowrank với q=C (rank thực sự của M.T@P là C) → chính xác & nhanh.
+    """
+    P  = P.to(M.device)
+    C  = M.shape[0]           # số class hiện tại
+    C_mat = M.T @ P           # (D, D) nhưng rank = C << D
+
+    # svd_lowrank với q=C+4 và niter=4 cho kết quả cực kỳ chính xác
+    # vì rank thực của C_mat đúng bằng C
+    q = min(C + 4, C_mat.shape[0], C_mat.shape[1])
+    U, S, V = torch.svd_lowrank(C_mat, q=q, niter=4)
     R = U @ V.T
     return R
 
@@ -299,23 +318,31 @@ class PrototypeClassifier:
         if not self.use_procrustes:
             return
 
-        sorted_cls = sorted(self.prototypes.keys())
+        sorted_cls  = sorted(self.prototypes.keys())
         num_classes = len(sorted_cls)
-        
-        # Nếu số lớp < 3, Procrustes có thể không ổn định, bỏ qua
+
+        # Chỉ align khi đủ class và đủ chiều
         if num_classes < 3 or self._current_dim < num_classes - 1:
             return
-            
-        # Tạo ETF Prototypes P (C, D)
+
+        # ── Tạo ETF Prototypes P (C, D) bằng công thức chuẩn ──────────────────
         P = create_etf_prototypes(num_classes, self._current_dim).to(self.device)
-        
-        # Tạo Empirical Means M (C, D)
-        M = torch.stack([self.prototypes[c] for c in sorted_cls], dim=0).to(self.device)
-        
-        # Tìm ma trận xoay R bằng Procrustes
+
+        # ── Tạo Empirical Means M (C, D) ──────────────────────────────────────
+        M_raw = torch.stack([self.prototypes[c] for c in sorted_cls], dim=0)
+        M     = F.normalize(M_raw.float(), p=2, dim=1).to(self.device)
+
+        # ── Tìm ma trận xoay R bằng Procrustes ────────────────────────────────
         self.R = procrustes_alignment(M, P)
-        
-        # Lưu lại ETF Prototypes tương ứng cho từng class
+
+        # ── Kiểm tra tính trực giao (log) ─────────────────────────────────────
+        # R là D×D, kiểm tra trên sub-space: ||R[:C].T @ R[:C] - I_C||_F
+        R_sub   = self.R[:num_classes, :]      # (C, D)
+        eye_err = torch.norm(R_sub @ R_sub.T - torch.eye(num_classes, device=self.device))
+        print(f"    [ETF-Procrustes] C={num_classes:3d} | "
+              f"ortho_err={eye_err:.4f} | R.shape={tuple(self.R.shape)}")
+
+        # ── Lưu lại ETF Prototypes tương ứng cho từng class ───────────────────
         self.etf_prototypes = {c: P[i].detach() for i, c in enumerate(sorted_cls)}
 
     def predict(self, z: torch.Tensor) -> torch.Tensor:
@@ -333,16 +360,23 @@ class PrototypeClassifier:
         z_float = z.float().to(self.device)
 
         if self.R is not None and len(self.etf_prototypes) > 0:
-            # Dùng ETF Prototypes và áp dụng ma trận xoay R
+            # [ETF mode] Xoay prototypes về z-space thay vì xoay z
+            # P_rot = P @ R.T  ≈ M (empirical means)  →  tương đương về lý thuyết
+            # nhưng tránh được nhân (N, D) x (D, D) lớn khi N nhỏ
             sorted_cls = sorted(self.etf_prototypes.keys())
-            P = torch.stack([self.etf_prototypes[c] for c in sorted_cls], dim=0)
-            # Biến đổi z: z_aligned = z @ R
-            z_float = z_float @ self.R
+            P_etf = torch.stack(
+                [self.etf_prototypes[c] for c in sorted_cls], dim=0
+            )                                               # (C, D)
+            # Xoay ngược ETF về không gian empirical
+            P = P_etf @ self.R.T                           # (C, D)
         else:
             # Dùng Empirical Means tạm thời
             sorted_cls = sorted(self.prototypes.keys())
-            P = torch.stack([self.prototypes[c] for c in sorted_cls], dim=0).float()
+            P = torch.stack(
+                [self.prototypes[c] for c in sorted_cls], dim=0
+            ).float()
 
+        # Chuẩn hóa z sau khi biến đổi để ổn định số
         z_norm = F.normalize(z_float, p=2, dim=1)   # (N, D)
         P_norm = F.normalize(P,       p=2, dim=1)   # (C, D)
         sim    = z_norm @ P_norm.T                  # (N, C)
