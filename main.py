@@ -13,6 +13,7 @@ import time
 import torch
 import numpy as np
 from torch.nn import functional as F
+from sklearn.cluster import KMeans
 
 from datasets.load_dataset import load_dataset
 from models.load_model import load_model
@@ -48,6 +49,10 @@ def get_parser() -> argparse.ArgumentParser:
     # [ETF] Bật/Tắt căn chỉnh Procrustes
     parser.add_argument('--use_procrustes', action='store_true',
                         help='Sử dụng ETF Prototypes và Procrustes Alignment')
+    
+    # [YC2] K prototypes per class
+    parser.add_argument('--num_prototypes', type=int, default=3,
+                        help='Number of prototypes per class (K-Means)')
 
     # Fisher-adaptive allocation
     parser.add_argument('--fisher_block', type=int,   default=512,
@@ -264,10 +269,11 @@ class PrototypeClassifier:
       • Block-wise WTA đã làm các block trực giao → NCM đủ mạnh.
     """
 
-    def __init__(self, device: torch.device, use_procrustes: bool = False):
+    def __init__(self, device: torch.device, use_procrustes: bool = False, num_prototypes: int = 3):
         self.device = device
         self.use_procrustes = use_procrustes
-        # global_class_idx → prototype tensor (D,)
+        self.num_prototypes = num_prototypes
+        # global_class_idx → prototype tensor (K, D)
         self.prototypes: dict[int, torch.Tensor] = {}
         self.etf_prototypes: dict[int, torch.Tensor] = {}
         self.R: torch.Tensor | None = None
@@ -282,10 +288,10 @@ class PrototypeClassifier:
         [YC2 - Zero-Padding] Khi projection mở rộng thêm num_new_neurons chiều,
         zero-pad cuối mỗi prototype cũ để giữ nhất quán số chiều D.
         """
-        pad = torch.zeros(num_new_neurons, device=self.device)
+        pad = torch.zeros(self.num_prototypes, num_new_neurons, device=self.device)
         for cls_idx in self.prototypes:
             self.prototypes[cls_idx] = torch.cat(
-                [self.prototypes[cls_idx], pad], dim=0
+                [self.prototypes[cls_idx], pad], dim=1
             )
         self._current_dim += num_new_neurons
 
@@ -296,8 +302,7 @@ class PrototypeClassifier:
         actual_classes: list[int],  # global class idx của task hiện tại
     ) -> None:
         """
-        Tính μ_c = mean(H[y==c]) và lưu vào prototypes[c].
-        Mỗi class chỉ xuất hiện trong 1 task → không cần cộng dồn.
+        Dùng K-Means phân cụm H[y==c] thành K prototypes.
         """
         H_dev = H.to(self.device)
         lbl   = labels.to(self.device)
@@ -305,7 +310,27 @@ class PrototypeClassifier:
             mask = (lbl == cls)
             if mask.sum() == 0:
                 continue
-            self.prototypes[cls] = H_dev[mask].mean(dim=0).detach()
+            
+            features_c = H_dev[mask]
+            N_c = features_c.shape[0]
+            K_c = min(self.num_prototypes, N_c)
+            
+            if K_c == 1:
+                protos = features_c.mean(dim=0, keepdim=True)
+            else:
+                kmeans = KMeans(n_clusters=K_c, n_init=10, random_state=42)
+                # KMeans trên CPU
+                kmeans.fit(features_c.cpu().numpy())
+                protos = torch.tensor(kmeans.cluster_centers_, device=self.device, dtype=features_c.dtype)
+            
+            # Pad nếu N_c < num_prototypes để luôn có shape (K, D)
+            if K_c < self.num_prototypes:
+                mean_proto = features_c.mean(dim=0, keepdim=True)
+                pad = mean_proto.repeat(self.num_prototypes - K_c, 1)
+                protos = torch.cat([protos, pad], dim=0)
+                
+            self.prototypes[cls] = protos.detach()
+            
         if self._current_dim == 0:
             self._current_dim = H.shape[1]
 
@@ -329,7 +354,8 @@ class PrototypeClassifier:
         P = create_etf_prototypes(num_classes, self._current_dim).to(self.device)
 
         # ── Tạo Empirical Means M (C, D) ──────────────────────────────────────
-        M_raw = torch.stack([self.prototypes[c] for c in sorted_cls], dim=0)
+        # Lấy mean của K prototypes cho mỗi class để tính M
+        M_raw = torch.stack([self.prototypes[c].mean(dim=0) for c in sorted_cls], dim=0)
         M     = F.normalize(M_raw.float(), p=2, dim=1).to(self.device)
 
         # ── Tìm ma trận xoay R bằng Procrustes ────────────────────────────────
@@ -347,7 +373,7 @@ class PrototypeClassifier:
 
     def predict(self, z: torch.Tensor) -> torch.Tensor:
         """
-        [YC2] ŷ = argmax_c cosine(h, μ_c).
+        [YC2] ŷ = argmax_c max_k cosine(h, μ_{c,k}).
 
         Args:
             z : (N, D) hoặc (D, N).
@@ -358,6 +384,7 @@ class PrototypeClassifier:
             z = z.T   # (D, N) → (N, D)
 
         z_float = z.float().to(self.device)
+        z_norm = F.normalize(z_float, p=2, dim=1)   # (N, D)
 
         if self.R is not None and len(self.etf_prototypes) > 0:
             # [ETF mode] Xoay prototypes về z-space thay vì xoay z
@@ -369,19 +396,25 @@ class PrototypeClassifier:
             )                                               # (C, D)
             # Xoay ngược ETF về không gian empirical
             P = P_etf @ self.R.T                           # (C, D)
+            P_norm = F.normalize(P,       p=2, dim=1)   # (C, D)
+            sim    = z_norm @ P_norm.T                  # (N, C)
+            local_preds = sim.argmax(dim=1)
         else:
-            # Dùng Empirical Means tạm thời
+            # Dùng K Empirical Prototypes
             sorted_cls = sorted(self.prototypes.keys())
-            P = torch.stack(
+            P = torch.cat(
                 [self.prototypes[c] for c in sorted_cls], dim=0
-            ).float()
+            ).float()                                      # (C * K, D)
+            
+            P_norm = F.normalize(P, p=2, dim=1)            # (C * K, D)
+            sim = z_norm @ P_norm.T                        # (N, C * K)
+            
+            # Reshape để tìm max cosine trong K prototypes của mỗi class
+            # sim: (N, C, K)
+            sim = sim.view(z_norm.shape[0], len(sorted_cls), self.num_prototypes)
+            sim_max, _ = sim.max(dim=2)                    # (N, C)
+            local_preds = sim_max.argmax(dim=1)
 
-        # Chuẩn hóa z sau khi biến đổi để ổn định số
-        z_norm = F.normalize(z_float, p=2, dim=1)   # (N, D)
-        P_norm = F.normalize(P,       p=2, dim=1)   # (C, D)
-        sim    = z_norm @ P_norm.T                  # (N, C)
-
-        local_preds = sim.argmax(dim=1)
         cls_t       = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
         return cls_t[local_preds].cpu()
 
@@ -432,7 +465,11 @@ if __name__ == "__main__":
     block_sizes = [args.expand_dim]
 
     # [YC2] Prototype Classifier — thay thế Ridge + UnifiedCosineClassifier
-    classifier = PrototypeClassifier(device=device, use_procrustes=args.use_procrustes)
+    classifier = PrototypeClassifier(
+        device=device,
+        use_procrustes=args.use_procrustes,
+        num_prototypes=args.num_prototypes
+    )
     classifier._current_dim = args.expand_dim  # Set cứng không gian 10000 chiều ngay từ đầu
 
     acc                  = {}
