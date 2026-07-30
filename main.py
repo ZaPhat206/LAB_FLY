@@ -219,8 +219,11 @@ def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
     """Tìm ma trận xoay R (D, D) sao cho M @ R gần P nhất."""
     P = P.to(M.device)
     C_mat = M.T @ P
-    U, _, Vh = torch.linalg.svd(C_mat, full_matrices=False)
-    R = U @ Vh
+    # Dùng Randomized SVD (svd_lowrank) để tránh treo máy với ma trận 10000x10000
+    # Vì M và P chỉ có tối đa C hàng (số class), rank của C_mat tối đa = C
+    q = min(M.shape[0] + 5, C_mat.shape[0], C_mat.shape[1])
+    U, S, V = torch.svd_lowrank(C_mat, q=q)
+    R = U @ V.T
     return R
 
 # =============================================================================
