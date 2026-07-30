@@ -63,8 +63,9 @@ def load_dataset(args, domain_name=None, train=None):
 
     # Load the full dataset
     if dataset == "CIFAR-100":
-        full_train_dataset = datasets.CIFAR100(root=root, train=True, download=True, transform=train_transform)
-        full_test_dataset = datasets.CIFAR100(root=root, train=False, download=True, transform=test_transform)
+        is_readonly = "kaggle/input" in root.replace('\\', '/')
+        full_train_dataset = datasets.CIFAR100(root=root, train=True, download=not is_readonly, transform=train_transform)
+        full_test_dataset = datasets.CIFAR100(root=root, train=False, download=not is_readonly, transform=test_transform)
     elif dataset == "CUB-200-2011":
         full_train_dataset = datasets.ImageFolder(root=f"{root}/cub/train/", transform=train_transform)
         full_test_dataset = datasets.ImageFolder(root=f"{root}/cub/test/", transform=test_transform)
