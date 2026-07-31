@@ -52,6 +52,10 @@ def get_parser() -> argparse.ArgumentParser:
                         help='Type of classifier: ncm, ridge_subspace, ridge')
     parser.add_argument('--use_subspace', action='store_true', default=False,
                         help='Enable subspace extraction for ridge_subspace')
+    parser.add_argument('--use_acp', action='store_true', default=False,
+                        help='Enable Analytic Contrastive Projection on subspace')
+    parser.add_argument('--subspace_rank', type=int, default=50,
+                        help='Rank r of the subspace (default 50)')
     # [ETF] Bật/Tắt căn chỉnh Procrustes
     parser.add_argument('--use_procrustes', action='store_true',
                         help='Sử dụng ETF Prototypes và Procrustes Alignment')
@@ -302,6 +306,8 @@ class UnifiedClassifier:
         self.use_procrustes = args.use_procrustes
         self.num_prototypes = args.num_prototypes
         self.use_subspace = args.use_subspace
+        self.use_acp = getattr(args, 'use_acp', False)
+        self.subspace_rank = getattr(args, 'subspace_rank', 50)
         
         if self.classifier_type == 'ridge_subspace' and not self.use_subspace:
             print("Warning: ridge_subspace selected but --use_subspace is False. Falling back to ridge.")
@@ -311,6 +317,7 @@ class UnifiedClassifier:
         self.etf_prototypes = {}
         self.R = None
         self.V_r = None
+        self.P_acp = None
         self._current_dim = 0
         
         # Cho Ridge
@@ -319,6 +326,7 @@ class UnifiedClassifier:
         self.Wo = None
         self.last_H = None
         self.last_Y = None
+        self.last_lbl = None
 
     @property
     def current_dim(self) -> int:
@@ -337,6 +345,7 @@ class UnifiedClassifier:
         lbl = labels.to(self.device)
         
         self.last_H = H_dev
+        self.last_lbl = lbl.clone()
         from utils import target2onehot
         self.last_Y = target2onehot(lbl, self.args.num_classes).float().to(self.device)
         
@@ -403,6 +412,7 @@ class UnifiedClassifier:
                 # Quá ít lớp, fallback về ridge gốc hoặc identity
                 self.V_r = None
                 self.R = None
+                self.P_acp = None
                 best_lam = 0.1
                 G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
                 L = torch.linalg.cholesky(G_reg)
@@ -414,8 +424,9 @@ class UnifiedClassifier:
             
             # SVD: U, S, V = torch.svd(M)
             U, S, Vh = torch.linalg.svd(M_raw, full_matrices=False)
-            r = min(num_classes - 1, (S > 1e-6).sum().item())
-            if r == 0: r = 1
+            max_r = self.subspace_rank
+            r = min(num_classes - 1, (S > 1e-6).sum().item(), max_r)
+            if r <= 0: r = 1
             
             self.V_r = Vh[:r, :].T # (D, r)
             
@@ -424,14 +435,70 @@ class UnifiedClassifier:
                 M_proj = M_raw @ self.V_r
                 M_proj_norm = F.normalize(M_proj, p=2, dim=1)
                 self.R = procrustes_alignment(M_proj_norm, P)
+                self.P_acp = None
+            elif self.use_acp and num_classes >= 2:
+                self.R = None
+                # Analytic Contrastive Projection (ACP)
+                H_proj = self.last_H @ self.V_r # (N_curr, r)
+                lbl_curr = self.last_lbl
+                
+                # Tính M_proj cho tất cả các lớp đã thấy (C x r)
+                M_proj = M_raw @ self.V_r
+                
+                # Tính shared covariance từ H_proj của task hiện tại
+                H_centered = torch.empty_like(H_proj)
+                unique_c = lbl_curr.unique()
+                for c in unique_c:
+                    mask = (lbl_curr == c)
+                    if mask.sum() > 0:
+                        H_centered[mask] = H_proj[mask] - H_proj[mask].mean(dim=0)
+                
+                Sigma = (H_centered.T @ H_centered) / H_centered.shape[0] # (r, r)
+                # Đảm bảo tính khả nghịch
+                Sigma = Sigma + 1e-6 * torch.eye(r, device=self.device)
+                
+                Us, Ss, _ = torch.linalg.svd(Sigma)
+                Sigma_inv_half = Us @ torch.diag((Ss + 1e-6)**(-0.5)) @ Us.T
+                Sigma_half = Us @ torch.diag(Ss**0.5) @ Us.T
+                
+                M_whitened = M_proj @ Sigma_inv_half # (C, r)
+                
+                Um, Sm, Vhm = torch.linalg.svd(M_whitened, full_matrices=False)
+                # Tăng cường separation
+                alpha = 1.0
+                S_enhanced = Sm + alpha
+                
+                # P_target: (C, r)
+                P_target = Um @ torch.diag(S_enhanced) @ Vhm @ Sigma_half
+                
+                # Tạo Y_target (N_curr, r) tương ứng với label của từng mẫu
+                # Y_target[i] = P_target[lbl_curr[i]]
+                # Lưu ý: P_target được index theo sorted_cls (0..num_classes-1).
+                # Label trong lbl_curr có thể là giá trị thực tế (VD: 10, 11,...).
+                # Ta cần ánh xạ lbl_curr về chỉ số trong sorted_cls.
+                cls_to_idx = {c: i for i, c in enumerate(sorted_cls)}
+                idx_curr = torch.tensor([cls_to_idx[c.item()] for c in lbl_curr], device=self.device)
+                Y_target = P_target[idx_curr]
+                
+                # Học phép chiếu P (r x r)
+                lam_P = 0.1
+                G_P = H_proj.T @ H_proj + lam_P * torch.eye(r, device=self.device)
+                Q_P = H_proj.T @ Y_target
+                L_P = torch.linalg.cholesky(G_P)
+                self.P_acp = torch.cholesky_solve(Q_P, L_P)
+                
             else:
                 self.R = None
+                self.P_acp = None
                 
-            # P_proj
+            # Tính P_proj
             if self.R is not None:
                 P_proj = self.V_r @ self.R
+            elif self.P_acp is not None:
+                P_proj = self.V_r @ self.P_acp
             else:
                 P_proj = self.V_r
+
                 
             # Vi V_r và R thay đổi mỗi task, Q và G phải được cộng dồn ở không gian gốc 10000D, 
             # sau đó chiếu xuống không gian con mới bằng P_proj để đảm bảo tính đúng đắn toán học.
@@ -491,6 +558,8 @@ class UnifiedClassifier:
                 H_test_proj = z_float @ self.V_r
                 if self.R is not None:
                     H_test_aligned = H_test_proj @ self.R
+                elif self.P_acp is not None:
+                    H_test_aligned = H_test_proj @ self.P_acp
                 else:
                     H_test_aligned = H_test_proj
                 logits = H_test_aligned @ self.Wo
