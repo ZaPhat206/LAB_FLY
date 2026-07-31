@@ -9,6 +9,7 @@ Cải tiến so với phiên bản cũ:
 """
 import argparse
 import time
+from typing import Optional
 
 import torch
 import numpy as np
@@ -333,9 +334,13 @@ class UnifiedClassifier:
         self.G_global = None
         self.Q_global = None
         self.Wo = None
+        self.class_counts = {}
         self.last_H = None
         self.last_Y = None
         self.last_lbl = None
+        # Tích lũy toàn bộ H, Y cho GCV (tránh chọn lambda chỉ theo task hiện tại)
+        self.H_accum = None
+        self.Y_accum = None
 
     @property
     def current_dim(self) -> int:
@@ -357,6 +362,10 @@ class UnifiedClassifier:
         self.last_lbl = lbl.clone()
         self.last_Y = torch.eye(self.args.num_classes, device=self.device)[lbl].float()
         
+        # Cập nhật số lượng mẫu cho mỗi class
+        for c in actual_classes:
+            self.class_counts[c] = self.class_counts.get(c, 0) + (lbl == c).sum().item()
+            
         # 1. Update prototypes (K-means cho NCM, hoặc mean bình thường)
         for cls in actual_classes:
             mask = (lbl == cls)
@@ -401,6 +410,36 @@ class UnifiedClassifier:
                 self.G_global += new_G
                 self.Q_global += new_Q
 
+            if self.H_accum is None:
+                self.H_accum = H_dev
+                self.Y_accum = self.last_Y
+            else:
+                self.H_accum = torch.cat([self.H_accum, H_dev], dim=0)
+                self.Y_accum = torch.cat([self.Y_accum, self.last_Y], dim=0)
+
+    def _global_class_means(self, sorted_cls: list[int]) -> torch.Tensor:
+        """Global mean từ Q_global — nhất quán với G_global thay vì prototype cũ."""
+        means = []
+        for c in sorted_cls:
+            n_c = self.class_counts[c]
+            means.append(self.Q_global[:, c] / n_c)
+        return torch.stack(means, dim=0).to(self.device)
+
+    def _gcv_H_Y(self, P_proj: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """H, Y dùng cho GCV: toàn bộ dữ liệu đã thấy (có thể chiếu subspace)."""
+        H_gcv = self.H_accum if self.H_accum is not None else self.last_H
+        Y_gcv = self.Y_accum if self.Y_accum is not None else self.last_Y
+        if P_proj is not None:
+            H_gcv = H_gcv @ P_proj
+        return H_gcv, Y_gcv
+
+    def _argmax_seen_classes(self, logits: torch.Tensor) -> torch.Tensor:
+        """Chỉ argmax trên class đã học — tránh chọn class chưa thấy (logit ≈ 0)."""
+        sorted_cls = sorted(self.prototypes.keys())
+        cls_t = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
+        logits_seen = logits[:, cls_t]
+        return cls_t[logits_seen.argmax(dim=1)].cpu()
+
     def align_prototypes(self) -> None:
         sorted_cls = sorted(self.prototypes.keys())
         num_classes = len(sorted_cls)
@@ -421,15 +460,16 @@ class UnifiedClassifier:
                 self.V_r = None
                 self.R = None
                 self.P_acp = None
-                best_lam = select_ridge_parameter(self.last_H, self.last_Y)
+                H_gcv, Y_gcv = self._gcv_H_Y()
+                best_lam = select_ridge_parameter(H_gcv, Y_gcv)
                 print(f"    [Ridge Fallback] C={num_classes:3d}, best_lam={best_lam}")
                 G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
                 L = torch.linalg.cholesky(G_reg)
                 self.Wo = torch.cholesky_solve(self.Q_global, L)
                 return
                 
-            # Tạo M từ mean của các class
-            M_raw = torch.cat([self.prototypes[c] for c in sorted_cls], dim=0) # (C, D)
+            # Global mean từ Q_global (khớp G_global, không dùng prototype cũ)
+            M_raw = self._global_class_means(sorted_cls)  # (C, D)
             
             # SVD: U, S, V = torch.svd(M)
             U, S, Vh = torch.linalg.svd(M_raw, full_matrices=False)
@@ -448,21 +488,24 @@ class UnifiedClassifier:
             elif self.use_acp and num_classes >= 2:
                 self.R = None
                 # Analytic Contrastive Projection (ACP)
-                H_proj = self.last_H @ self.V_r # (N_curr, r)
-                lbl_curr = self.last_lbl
                 
                 # Tính M_proj cho tất cả các lớp đã thấy (C x r)
                 M_proj = M_raw @ self.V_r
                 
-                # Tính shared covariance từ H_proj của task hiện tại
-                H_centered = torch.empty_like(H_proj)
-                unique_c = lbl_curr.unique()
-                for c in unique_c:
-                    mask = (lbl_curr == c)
-                    if mask.sum() > 0:
-                        H_centered[mask] = H_proj[mask] - H_proj[mask].mean(dim=0)
+                # Khôi phục chính xác Global Shared Covariance Sigma (r x r) từ G_global
+                N_c = torch.tensor([self.class_counts[c] for c in sorted_cls], device=self.device).float()
+                N_total = N_c.sum().item()
                 
-                Sigma = (H_centered.T @ H_centered) / H_centered.shape[0] # (r, r)
+                # G_proj = V_r.T @ G_global @ V_r  (r x r)
+                G_proj_exact = self.V_r.T @ self.G_global @ self.V_r
+                
+                # Between-class scatter: sum(N_c * mu_c * mu_c.T) = M_proj.T @ diag(N_c) @ M_proj
+                S_b = M_proj.T @ (N_c.unsqueeze(1) * M_proj)
+                
+                # Within-class scatter = G_proj - S_b
+                S_w = G_proj_exact - S_b
+                Sigma = S_w / N_total
+                
                 # Đảm bảo tính khả nghịch
                 Sigma = Sigma + 1e-6 * torch.eye(r, device=self.device)
                 
@@ -480,20 +523,21 @@ class UnifiedClassifier:
                 # P_target: (C, r)
                 P_target = Um @ torch.diag(S_enhanced) @ Vhm @ Sigma_half
                 
-                # Tạo Y_target (N_curr, r) tương ứng với label của từng mẫu
-                # Y_target[i] = P_target[lbl_curr[i]]
-                # Lưu ý: P_target được index theo sorted_cls (0..num_classes-1).
-                # Label trong lbl_curr có thể là giá trị thực tế (VD: 10, 11,...).
-                # Ta cần ánh xạ lbl_curr về chỉ số trong sorted_cls.
-                cls_to_idx = {c: i for i, c in enumerate(sorted_cls)}
-                idx_curr = torch.tensor([cls_to_idx[c.item()] for c in lbl_curr], device=self.device)
-                Y_target = P_target[idx_curr]
+                # Học phép chiếu P (r x r) từ Global Data!
+                # P_acp = (H_proj_all.T H_proj_all + lam_P I)^-1 H_proj_all.T Y_target_all
+                # Với H_proj_all.T Y_target_all = (V_r.T Q_global) @ P_target
                 
-                # Học phép chiếu P (r x r)
+                # Pad P_target lên num_classes (100) để nhân được với Q_proj_exact (r x 100)
+                P_target_padded = torch.zeros(self.args.num_classes, r, device=self.device)
+                cls_indices = torch.tensor(sorted_cls, dtype=torch.long, device=self.device)
+                P_target_padded[cls_indices] = P_target
+                
+                Q_proj_exact = self.V_r.T @ self.Q_global # (r, 100)
+                Q_P = Q_proj_exact @ P_target_padded      # (r, r)
+                
                 lam_P = 0.1
                 print(f"    [ACP Subspace] C={num_classes:3d}, r={r}, lam_P={lam_P}, alpha={alpha}")
-                G_P = H_proj.T @ H_proj + lam_P * torch.eye(r, device=self.device)
-                Q_P = H_proj.T @ Y_target
+                G_P = G_proj_exact + lam_P * torch.eye(r, device=self.device)
                 L_P = torch.linalg.cholesky(G_P)
                 self.P_acp = torch.cholesky_solve(Q_P, L_P)
                 
@@ -515,9 +559,9 @@ class UnifiedClassifier:
             G_proj = P_proj.T @ self.G_global @ P_proj # (r, r)
             Q_proj = P_proj.T @ self.Q_global # (r, C)
             
-            # GCV trên H_aligned của task hiện tại
-            H_aligned = self.last_H @ P_proj
-            best_lam = select_ridge_parameter(H_aligned, self.last_Y)
+            # GCV trên toàn bộ dữ liệu đã thấy trong subspace hiện tại
+            H_gcv, Y_gcv = self._gcv_H_Y(P_proj)
+            best_lam = select_ridge_parameter(H_gcv, Y_gcv)
             
             print(f"    [Ridge Subspace] C={num_classes:3d}, r={r}, best_lam={best_lam}")
             
@@ -527,13 +571,14 @@ class UnifiedClassifier:
             
         elif self.classifier_type == 'ridge':
             # Giải Ridge gốc 10000D
-            best_lam = select_ridge_parameter(self.last_H, self.last_Y)
+            H_gcv, Y_gcv = self._gcv_H_Y()
+            best_lam = select_ridge_parameter(H_gcv, Y_gcv)
             print(f"    [Ridge] C={num_classes:3d}, Full D={self._current_dim}, best_lam={best_lam}")
             G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
             try:
                 L = torch.linalg.cholesky(G_reg)
                 self.Wo = torch.cholesky_solve(self.Q_global, L)
-            except:
+            except torch.linalg.LinAlgError:
                 self.Wo = torch.linalg.solve(G_reg, self.Q_global)
 
     def predict(self, z: torch.Tensor) -> torch.Tensor:
@@ -575,11 +620,11 @@ class UnifiedClassifier:
                 logits = H_test_aligned @ self.Wo
             else:
                 logits = z_float @ self.Wo
-            return logits.argmax(dim=1).cpu()
+            return self._argmax_seen_classes(logits)
             
         elif self.classifier_type == 'ridge':
             logits = z_float @ self.Wo
-            return logits.argmax(dim=1).cpu()
+            return self._argmax_seen_classes(logits)
 
     def evaluate(self, H: torch.Tensor, labels: torch.Tensor) -> float:
         if H.is_sparse:
