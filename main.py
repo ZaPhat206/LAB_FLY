@@ -259,9 +259,14 @@ def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
     C_mat = M.T @ P           # (D, D) nhưng rank = C << D
 
     # svd_lowrank với q=C+4 và niter=4 cho kết quả cực kỳ chính xác
-    # vì rank thực của C_mat đúng bằng C
-    q = min(C + 4, C_mat.shape[0], C_mat.shape[1])
-    U, S, V = torch.svd_lowrank(C_mat, q=q, niter=4)
+    # vì rank thực của C_mat đúng bằng C. Nhưng nếu D đủ nhỏ, linalg.svd sẽ tốt hơn tuyệt đối.
+    if C_mat.shape[0] <= 1000:
+        U, S, Vh = torch.linalg.svd(C_mat, full_matrices=False)
+        V = Vh.T
+    else:
+        q = min(C + 4, C_mat.shape[0], C_mat.shape[1])
+        U, S, V = torch.svd_lowrank(C_mat, q=q, niter=4)
+        
     R = U @ V.T
     return R
 
@@ -273,31 +278,32 @@ def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
 def select_ridge_parameter(H, Y, lambdas=None):
     if lambdas is None:
         lambdas = [10**i for i in range(-5, 6)]
-    N = H.shape[0]
+    N, D = H.shape
     best_lambda = lambdas[0]
     best_score = float('inf')
     
-    HTH = H.T @ H
-    HTY = H.T @ Y
+    # Sử dụng SVD để tính GCV (Nhanh và cực kỳ ổn định, chuẩn Fly-CL)
+    U, S, Vh = torch.linalg.svd(H, full_matrices=False)
+    Z = U.T @ Y
+    S2 = S ** 2
+    
+    Y_norm_sq = (Y ** 2).sum().item()
+    Z_norm_sq = (Z ** 2).sum().item()
+    base_error = Y_norm_sq - Z_norm_sq
     
     for l in lambdas:
-        G = HTH + l * torch.eye(H.shape[1], device=H.device)
-        try:
-            L = torch.linalg.cholesky(G)
-            Wo = torch.cholesky_solve(HTY, L)
-            Y_pred = H @ Wo
-            error = torch.norm(Y - Y_pred, p='fro') ** 2
+        filter_factors = l / (S2 + l) # (K,) với K = min(N, D)
+        Z_diff = filter_factors.unsqueeze(1) * Z
+        error = base_error + (Z_diff ** 2).sum().item()
+        
+        tr_H_hat = len(S) - filter_factors.sum().item()
+        denominator = (1 - tr_H_hat / N) ** 2
+        gcv_score = error / (N * denominator)
+        
+        if gcv_score < best_score:
+            best_score = gcv_score
+            best_lambda = l
             
-            G_inv = torch.cholesky_inverse(L)
-            tr_H_hat = H.shape[1] - l * torch.trace(G_inv)
-            
-            denominator = (1 - tr_H_hat / N) ** 2
-            gcv_score = error / (N * denominator)
-            if gcv_score < best_score:
-                best_score = gcv_score
-                best_lambda = l
-        except Exception:
-            continue
     return best_lambda
 
 class UnifiedClassifier:
@@ -349,8 +355,7 @@ class UnifiedClassifier:
         
         self.last_H = H_dev
         self.last_lbl = lbl.clone()
-        from utils import target2onehot
-        self.last_Y = target2onehot(lbl, self.args.num_classes).float().to(self.device)
+        self.last_Y = torch.eye(self.args.num_classes, device=self.device)[lbl].float()
         
         # 1. Update prototypes (K-means cho NCM, hoặc mean bình thường)
         for cls in actual_classes:
@@ -416,7 +421,8 @@ class UnifiedClassifier:
                 self.V_r = None
                 self.R = None
                 self.P_acp = None
-                best_lam = 0.1
+                best_lam = select_ridge_parameter(self.last_H, self.last_Y)
+                print(f"    [Ridge Fallback] C={num_classes:3d}, best_lam={best_lam}")
                 G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
                 L = torch.linalg.cholesky(G_reg)
                 self.Wo = torch.cholesky_solve(self.Q_global, L)
@@ -521,8 +527,8 @@ class UnifiedClassifier:
             
         elif self.classifier_type == 'ridge':
             # Giải Ridge gốc 10000D
-            best_lam = 0.1 # Tránh GCV trên 10000D vì quá chậm
-            print(f"    [Ridge] C={num_classes:3d}, Full D={self._current_dim}")
+            best_lam = select_ridge_parameter(self.last_H, self.last_Y)
+            print(f"    [Ridge] C={num_classes:3d}, Full D={self._current_dim}, best_lam={best_lam}")
             G_reg = self.G_global + best_lam * torch.eye(self.G_global.shape[0], device=self.device)
             try:
                 L = torch.linalg.cholesky(G_reg)
