@@ -56,6 +56,8 @@ def get_parser() -> argparse.ArgumentParser:
                         help='Enable Analytic Contrastive Projection on subspace')
     parser.add_argument('--subspace_rank', type=int, default=50,
                         help='Rank r of the subspace (default 50)')
+    parser.add_argument('--acp_alpha', type=float, default=1.0,
+                        help='Alpha parameter for ACP separation enhancement')
     # [ETF] Bật/Tắt căn chỉnh Procrustes
     parser.add_argument('--use_procrustes', action='store_true',
                         help='Sử dụng ETF Prototypes và Procrustes Alignment')
@@ -308,6 +310,7 @@ class UnifiedClassifier:
         self.use_subspace = args.use_subspace
         self.use_acp = getattr(args, 'use_acp', False)
         self.subspace_rank = getattr(args, 'subspace_rank', 50)
+        self.acp_alpha = getattr(args, 'acp_alpha', 1.0)
         
         if self.classifier_type == 'ridge_subspace' and not self.use_subspace:
             print("Warning: ridge_subspace selected but --use_subspace is False. Falling back to ridge.")
@@ -465,7 +468,7 @@ class UnifiedClassifier:
                 
                 Um, Sm, Vhm = torch.linalg.svd(M_whitened, full_matrices=False)
                 # Tăng cường separation
-                alpha = 1.0
+                alpha = self.acp_alpha
                 S_enhanced = Sm + alpha
                 
                 # P_target: (C, r)
@@ -482,6 +485,7 @@ class UnifiedClassifier:
                 
                 # Học phép chiếu P (r x r)
                 lam_P = 0.1
+                print(f"    [ACP Subspace] C={num_classes:3d}, r={r}, lam_P={lam_P}, alpha={alpha}")
                 G_P = H_proj.T @ H_proj + lam_P * torch.eye(r, device=self.device)
                 Q_P = H_proj.T @ Y_target
                 L_P = torch.linalg.cholesky(G_P)
@@ -575,7 +579,6 @@ class UnifiedClassifier:
         if H.is_sparse:
             H = H.to_dense()
         preds = self.predict(H)
-        return (preds == labels.cpu()).float().mean().item() * 100.0
         return (preds == labels.cpu()).float().mean().item() * 100.0
 
 
