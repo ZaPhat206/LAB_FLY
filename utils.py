@@ -24,7 +24,7 @@ def get_parameters(model: nn.Module):
 def feature_extract(model: nn.Module, data_loader: DataLoader, device: torch.device):
     embedding_list, label_list = [], []
     with torch.no_grad():
-        for i, (data, label) in enumerate(tqdm(data_loader)):
+        for i, (data, label) in enumerate(tqdm(data_loader, leave=False, dynamic_ncols=True, mininterval=1.0)):
             data, label = data.to(device), label.to(device)
             embedding = model(data)
             embedding_list.append(embedding)
