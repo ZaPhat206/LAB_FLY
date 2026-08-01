@@ -426,9 +426,9 @@ class UnifiedClassifier:
         return torch.stack(means, dim=0).to(self.device)
 
     def _gcv_H_Y(self, P_proj: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """H, Y dùng cho GCV: toàn bộ dữ liệu đã thấy (có thể chiếu subspace)."""
-        H_gcv = self.H_accum if self.H_accum is not None else self.last_H
-        Y_gcv = self.Y_accum if self.Y_accum is not None else self.last_Y
+        """GCV chỉ tính trên Task hiện tại để đảm bảo siêu tốc độ. Dùng H_accum sẽ khiến SVD sập nguồn!"""
+        H_gcv = self.last_H
+        Y_gcv = self.last_Y
         if P_proj is not None:
             H_gcv = H_gcv @ P_proj
         return H_gcv, Y_gcv
