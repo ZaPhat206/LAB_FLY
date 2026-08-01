@@ -278,7 +278,8 @@ def procrustes_alignment(M: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
 
 def select_ridge_parameter(H, Y, lambdas=None):
     if lambdas is None:
-        lambdas = [10**i for i in range(-5, 6)]
+        # BẮT BUỘC GIỮ DÒNG NÀY: Không cho phép lambda quá nhỏ để cứu Task 00 và 01 khỏi bị khuếch đại nhiễu!
+        lambdas = [10**i for i in range(-1, 6)]
     N, D = H.shape
     best_lambda = lambdas[0]
     best_score = float('inf')
